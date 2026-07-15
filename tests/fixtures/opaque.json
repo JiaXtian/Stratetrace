@@ -1,0 +1,16 @@
+{
+  "source": "192.0.2.10",
+  "destination": "203.0.113.9",
+  "hops": {
+    "1": {"fixed": ["10.0.0.1"], "varied": ["10.0.0.1"], "rtt_ms": 1.0},
+    "2": {"fixed": ["10.0.1.1"], "varied": ["10.0.1.1"], "rtt_ms": 2.0},
+    "3": {"fixed": [null], "varied": [null]},
+    "4": {
+      "fixed": ["203.0.113.9"],
+      "varied": ["203.0.113.9"],
+      "rtt_ms": 7.0,
+      "terminal": true,
+      "mpls": [{"label": 16003, "ttl": 1, "bottom_of_stack": true}]
+    }
+  }
+}
