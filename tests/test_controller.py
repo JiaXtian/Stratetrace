@@ -33,6 +33,29 @@ class ControllerTests(unittest.TestCase):
         self.assertTrue(result.segments)
         self.assertTrue(all(item.type == SegmentType.DIRECT for item in result.segments))
 
+    def test_zero_response_stops_after_one_sweep_without_false_direct_segment(self):
+        result = run_scenario("all_timeout")
+        self.assertFalse(result.reached)
+        self.assertEqual(result.probe_count, 8)
+        self.assertEqual(result.adaptive_probe_count, 0)
+        self.assertFalse(result.segments)
+        self.assertTrue(any("No ICMP response" in item for item in result.warnings))
+
+    def test_global_cap_does_not_spend_more_when_no_boundary_is_visible(self):
+        backend = ScriptedBackend(FIXTURES / "all_timeout.json")
+        config = TraceConfig(
+            max_hops=8,
+            chunk_size=4,
+            global_cap=True,
+            min_detectable_probability=0.5,
+            miss_probability=0.25,
+            max_probes=128,
+            seed=7,
+        )
+        result = TraceController(backend, config).run("all-timeout")
+        self.assertEqual(result.probe_count, 8)
+        self.assertFalse(result.segments)
+
     def test_opaque_gap_has_explicit_mpls_evidence(self):
         result = run_scenario("opaque")
         opaque = [item for item in result.segments if item.type == SegmentType.OPAQUE]

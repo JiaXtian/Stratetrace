@@ -2,7 +2,7 @@ import socket
 import unittest
 from types import SimpleNamespace
 
-from stratatrace.backend import RawIPv4Backend
+from stratatrace.backend import RawIPv4Backend, benchmark_address_diagnostic
 from stratatrace.model import FlowKey, ProbeProtocol
 
 
@@ -43,6 +43,12 @@ class BackendEvidenceTests(unittest.TestCase):
         mutations = self.backend._mutations(parsed, self.flow)
         self.assertEqual(len(mutations), 5)
         self.assertIn("dscp-ecn:0->32", mutations)
+
+    def test_rfc2544_fake_ip_addresses_are_diagnosed(self):
+        diagnostic = benchmark_address_diagnostic("198.18.6.85", "198.18.0.1")
+        self.assertIn("fake-IP TUN", diagnostic)
+        self.assertIn("destination=198.18.6.85", diagnostic)
+        self.assertIsNone(benchmark_address_diagnostic("1.1.1.1", "10.0.0.2"))
 
 
 if __name__ == "__main__":

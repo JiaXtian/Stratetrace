@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import ipaddress
 import random
 import select
 import socket
@@ -36,6 +37,31 @@ class BackendError(RuntimeError):
 
 class PrivilegeError(BackendError):
     pass
+
+
+BENCHMARK_NETWORK = ipaddress.IPv4Network("198.18.0.0/15")
+
+
+def benchmark_address_diagnostic(destination: str, source: str) -> Optional[str]:
+    """Explain RFC 2544 addresses commonly used by fake-IP/TUN proxies."""
+
+    affected = []
+    for role, address in (("destination", destination), ("source", source)):
+        try:
+            if ipaddress.IPv4Address(address) in BENCHMARK_NETWORK:
+                affected.append(f"{role}={address}")
+        except ipaddress.AddressValueError:
+            continue
+    if not affected:
+        return None
+    return (
+        f"{', '.join(affected)} is inside 198.18.0.0/15, the RFC 2544 "
+        "benchmarking range. For public hostnames this usually means a VPN/proxy "
+        "fake-IP TUN is active; raw TTL probes only see the synthetic mapping and "
+        "cannot measure the original Internet path. Disable fake-IP/TUN routing "
+        "for the measurement, or use --allow-benchmark-address only for an "
+        "intentional isolated benchmark lab."
+    )
 
 
 class ProbeBackend(Protocol):
@@ -77,9 +103,16 @@ class RawIPv4Backend:
         timeout: float = 1.0,
         pacing_ms: float = 1.0,
         session_id: Optional[int] = None,
+        allow_benchmark_address: bool = False,
     ) -> None:
         self.destination = destination
+        destination_diagnostic = benchmark_address_diagnostic(self.destination, "0.0.0.0")
+        if destination_diagnostic and not allow_benchmark_address:
+            raise BackendError(destination_diagnostic)
         self.source = source or discover_ipv4_source(destination)
+        diagnostic = benchmark_address_diagnostic(self.destination, self.source)
+        if diagnostic and not allow_benchmark_address:
+            raise BackendError(diagnostic)
         self.timeout = timeout
         self.pacing_seconds = pacing_ms / 1000.0
         self.session_id = session_id if session_id is not None else random.SystemRandom().getrandbits(32)

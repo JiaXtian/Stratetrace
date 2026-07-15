@@ -46,9 +46,15 @@ Python 3.9+ is required; runtime dependencies are zero.
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install -e .
+.venv/bin/pip install .
 sudo .venv/bin/stratatrace example.com
 ```
+
+For development on macOS with Python 3.14+, use a non-hidden environment such
+as `python3 -m venv venv && venv/bin/pip install -e .`. Python 3.14 skips `.pth`
+files carrying macOS's `hidden` flag; an editable install inside `.venv` can
+therefore leave a working launcher that cannot import `stratatrace`. Install as
+the normal user and use `sudo` only for the probe command.
 
 Raw IPv4 sockets require root on macOS and usually root or `CAP_NET_RAW` on
 Linux. StrataTrace fails closed when raw access is unavailable—it does not
@@ -78,6 +84,39 @@ The fixed UDP destination port defaults to 33434. If that service is open at
 the destination, choose another closed port with `--dport`. UDP checksums are
 zero to preserve the flow identity while changing the correlation payload;
 this is valid for IPv4 but one reason this release does not claim IPv6 support.
+
+## Troubleshooting macOS VPN/proxy fake IPs
+
+If a public hostname resolves to `198.18.x.x`, it is not the public server's
+address. `198.18.0.0/15` is reserved by IANA for benchmarking and is commonly
+used as a synthetic address pool by VPN/proxy TUN implementations. Raw TTL
+probes sent to that address cannot reconstruct the original Internet path.
+
+StrataTrace now stops before probing and reports this condition. Correct it by
+disabling the VPN/proxy TUN temporarily, or configure both DNS and routing for
+the measurement target to bypass fake-IP/TUN handling. Merely using a numeric
+public IP is insufficient when its route still points at the TUN interface.
+
+Check the active state on macOS with:
+
+```bash
+dscacheutil -q host -a name example.com
+route -n get 1.1.1.1
+ifconfig | grep -A4 utun
+```
+
+`--allow-benchmark-address` is provided only for an intentional isolated RFC
+2544 lab. It should not be used to suppress this warning for public targets.
+
+If the launcher exists but reports `ModuleNotFoundError`, repair the virtual
+environment with a normal wheel installation as the normal user:
+
+```bash
+.venv/bin/python -m pip install --force-reinstall .
+.venv/bin/python -c 'import stratatrace; print(stratatrace.__version__)'
+```
+
+Do not run `sudo pip install`; only the final raw-socket probe needs `sudo`.
 
 ## Reproducible demos without privileges
 
@@ -162,6 +201,8 @@ These are measurement-model boundaries, not hidden caveats.
 - [RFC 4884 — Extended ICMP to Support Multi-Part Messages](https://www.rfc-editor.org/rfc/rfc4884.html)
 - [RFC 4950 — ICMP Extensions for MPLS](https://www.rfc-editor.org/rfc/rfc4950.html)
 - [RFC 5837 — Interface and Next-Hop Identification](https://www.rfc-editor.org/rfc/rfc5837.html)
+- [IANA IPv4 Special-Purpose Address Registry](https://www.iana.org/assignments/iana-ipv4-special-registry/iana-ipv4-special-registry.xhtml)
+- [RFC 2544 — Network Interconnect Device Benchmarking](https://www.rfc-editor.org/rfc/rfc2544.html)
 - [Paris traceroute publications](https://paris-traceroute.net/publications/)
 
 ## Safety

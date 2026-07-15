@@ -99,12 +99,19 @@ class TraceController:
         main_flow = self._main_flow()
         terminal_ttl = self._baseline(main_flow)
         analysis_limit = terminal_ttl or self._last_observed_ttl() or self.config.max_hops
-        self._flow_canaries(main_flow, analysis_limit)
-        regions = self._find_regions(analysis_limit)
+        baseline_answered = any(
+            item.answered and item.spec.phase == "baseline-fixed"
+            for item in self.observations
+        )
+        if baseline_answered:
+            self._flow_canaries(main_flow, analysis_limit)
+            regions = self._find_regions(analysis_limit)
+        else:
+            regions = []
         required = required_samples(
             self.config.min_detectable_probability, self.config.miss_probability
         )
-        if self.config.global_cap:
+        if self.config.global_cap and baseline_answered:
             global_region = BoundaryRegion(
                 1,
                 analysis_limit,
@@ -122,7 +129,7 @@ class TraceController:
         ]
         reached = bool(reached_ttls)
         stop_ttl = min(reached_ttls) if reached_ttls else terminal_ttl
-        if not regions:
+        if not regions and baseline_answered:
             self.warnings.append(
                 "No ambiguous boundary was found; clear hops remain rapid-sweep observations, "
                 "not CAP-certified stable edges."
@@ -225,7 +232,8 @@ class TraceController:
 
     def _baseline(self, flow: FlowKey) -> Optional[int]:
         terminal_ttl: Optional[int] = None
-        for _ in range(self.config.baseline_rounds):
+        for round_index in range(self.config.baseline_rounds):
+            round_start = len(self.observations)
             sweep_limit = terminal_ttl or self.config.max_hops
             sample_id = self._new_sample_id()
             for start in range(1, sweep_limit + 1, self.config.chunk_size):
@@ -251,6 +259,15 @@ class TraceController:
                         else min(terminal_ttl, observed_terminal)
                     )
                     break
+            round_observations = self.observations[round_start:]
+            if round_index == 0 and not any(item.answered for item in round_observations):
+                self.warnings.append(
+                    "No ICMP response was received during the first complete fixed-flow "
+                    "sweep. DBP/CAP was skipped because no visible boundary exists to "
+                    "analyze. Check VPN/TUN routing, host/network firewalls, raw-socket "
+                    "packet format, and target reachability."
+                )
+                break
         return terminal_ttl
 
     def _flow_canaries(self, main_flow: FlowKey, limit: int) -> None:
@@ -496,6 +513,7 @@ class TraceController:
             for ttl in region.probe_ttls
         )
         mutations = sorted({mutation for item in fixed + varied for mutation in item.mutations})
+        fully_answered = bool(fixed and varied) and all(item.answered for item in fixed + varied)
         labels = [
             label
             for item in fixed + varied
@@ -523,7 +541,12 @@ class TraceController:
             reasons.append(
                 "flow variants changed response/loss behavior without revealing multiple responders"
             )
-        elif fixed_counts and varied_counts and set(fixed_counts) == set(varied_counts):
+        elif (
+            fully_answered
+            and fixed_counts
+            and varied_counts
+            and set(fixed_counts) == set(varied_counts)
+        ):
             segment_type = SegmentType.DIRECT
             reasons.append("fixed and varied flows agreed across the certified TTL window")
         else:

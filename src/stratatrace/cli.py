@@ -43,6 +43,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dport", type=int, default=33434, help="fixed UDP destination port")
     parser.add_argument("--sport", type=int, help="fixed UDP source port")
     parser.add_argument("--source", help="explicit IPv4 source address")
+    parser.add_argument(
+        "--allow-benchmark-address",
+        action="store_true",
+        help="allow 198.18.0.0/15 only for an intentional isolated RFC 2544 lab",
+    )
     parser.add_argument("--payload-size", type=int, default=32)
     parser.add_argument("--profile", choices=PROFILES, default="default")
     parser.add_argument(
@@ -124,6 +129,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 source=args.source,
                 timeout=config.timeout,
                 pacing_ms=config.pacing_ms,
+                allow_benchmark_address=args.allow_benchmark_address,
             )
         result = TraceController(backend, config).run(args.target)
         if args.json:
