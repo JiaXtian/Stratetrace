@@ -3,7 +3,9 @@ import io
 import json
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from stratatrace.backend import ScriptedBackend
 from stratatrace.cli import main
 
 
@@ -11,6 +13,33 @@ FIXTURES = Path(__file__).parent / "fixtures"
 
 
 class CliTests(unittest.TestCase):
+    def test_interrupt_prints_partial_result_and_returns_130(self):
+        class InterruptingBackend(ScriptedBackend):
+            def __init__(self, fixture):
+                super().__init__(fixture)
+                self.calls = 0
+
+            def send_batch(self, specs):
+                self.calls += 1
+                if self.calls == 2:
+                    raise KeyboardInterrupt
+                return super().send_batch(specs)
+
+        stdout = io.StringIO()
+        with mock.patch("stratatrace.cli.ScriptedBackend", InterruptingBackend):
+            with contextlib.redirect_stdout(stdout):
+                status = main(
+                    [
+                        "--simulate",
+                        str(FIXTURES / "transparent.json"),
+                        "--max-hops",
+                        "8",
+                        "example.invalid",
+                    ]
+                )
+        self.assertEqual(status, 130)
+        self.assertIn("PARTIAL", stdout.getvalue())
+
     def test_simulated_json_is_valid_and_reached(self):
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout):

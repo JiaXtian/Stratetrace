@@ -18,13 +18,22 @@ DBP separates effects using two axes:
 |---|---|---|
 | stable | stable and equal | direct/transparent |
 | stable | different signatures | per-flow multipath |
-| changing | any | unstable/dynamic |
+| different responder addresses | any | unstable/dynamic |
+| stable responder, intermittent replies | any | intermittent ICMP visibility |
 | stable visible boundaries, stable missing interior | no variant reveals the interior | opaque observation gap |
 | quoted invoking header differs | any | mutable boundary |
 
 A baseline fixed-flow rapid sweep and one cheap flow canary locate suspicious
-regions. CAP then samples only those local regions. `--global-cap` replaces
-this trigger policy with one whole-path region.
+regions. CAP then samples only those local regions. Fixed-flow temporal evidence
+uses the independent `--temporal-samples` target (three by default); the CAP
+sample bound is spent only when an unobservable/intermittent or flow-sensitive
+region actually requires cross-flow coverage. `--global-cap` replaces this
+trigger policy with one whole-path region.
+
+Timeouts are not responder identities. A sequence such as `A, *, A` therefore
+supports `INTERMITTENT`, not `UNSTABLE`. This distinction is necessary because
+ICMP error generation is control-plane behavior and may be rate-limited even
+while data-plane forwarding continues.
 
 For a short gap, every TTL in the boundary window is repeated. For a long gap,
 the baseline covers every TTL once while DBP repeats its two adjacent boundary
@@ -60,6 +69,25 @@ This is a *detection* guarantee, not a topology-recovery theorem. It says that
 an alternative behavior with at least the specified mass is unlikely to have
 been entirely missed under the model assumptions. It does not say that rare
 paths do not exist.
+
+The bound applies to controlled flow variants only. Fixed-flow repeated
+observations are reported as repeatability evidence and deliberately carry no
+claim about undiscovered flow-token behavior.
+
+## Probe-cost policy
+
+The first fixed-flow sweep covers the configured maximum TTL. Later baseline
+repeats stop at the visible range plus a small configurable tail guard. Within
+an adaptive region, fixed-flow repetition stops at `temporal_samples`, while
+flow variants continue to the CAP bound only when that experimental axis is
+needed. Multiple variant bundles are transmitted in one receive batch, without
+changing the sample identifiers or flow tokens, reducing timeout latency while
+preserving the coverage calculation.
+
+Persistent quoted-header mutations are treated as a change-point signal. If a
+DSCP rewrite first appears at TTL 11 and remains visible at later hops, only the
+10–11 neighborhood is a mutation boundary; downstream quotations are evidence
+of persistence, not additional rewrite locations.
 
 ## Identifiability limit
 

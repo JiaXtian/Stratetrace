@@ -276,8 +276,13 @@ class RawIPv4Backend:
         if quoted_destination is not None and quoted_destination != self.destination:
             mutations.append(f"destination-address:{self.destination}->{quoted_destination}")
         quoted_dscp_ecn = getattr(parsed, "quoted_dscp_ecn")
-        if quoted_dscp_ecn not in (None, 0):
-            mutations.append(f"dscp-ecn:0->{quoted_dscp_ecn}")
+        if quoted_dscp_ecn is not None:
+            quoted_dscp = quoted_dscp_ecn >> 2
+            quoted_ecn = quoted_dscp_ecn & 0x03
+            if quoted_dscp:
+                mutations.append(f"dscp:0->{quoted_dscp}")
+            if quoted_ecn:
+                mutations.append(f"ecn:0->{quoted_ecn}")
         if flow.protocol == ProbeProtocol.UDP:
             quoted_source_port = getattr(parsed, "quoted_source_port")
             if quoted_source_port is not None and quoted_source_port != flow.source_port:

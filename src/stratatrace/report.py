@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import List
 
-from .model import SegmentType, TraceResult
+from .model import ReplyKind, SegmentType, TraceResult
 
 
 def render_json(result: TraceResult, include_observations: bool = False) -> str:
@@ -19,14 +19,17 @@ def render_json(result: TraceResult, include_observations: bool = False) -> str:
 
 def render_text(result: TraceResult, verbose: bool = False) -> str:
     lines: List[str] = []
+    span = f", TTL 1-{result.probed_max_ttl} probed" if result.probed_max_ttl > len(result.hops) else ""
+    partial = ", PARTIAL" if result.interrupted else ""
     lines.append(
         f"StrataTrace to {result.target} ({result.destination}) from {result.source}, "
-        f"{result.protocol.value.upper()}, {len(result.hops)} hops analyzed"
+        f"{result.protocol.value.upper()}, {len(result.hops)} hops analyzed{span}{partial}"
     )
     lines.append(
         f"policy: p_min={result.policy['min_detectable_probability']:.3f}, "
         f"delta={result.policy['requested_miss_probability']:.3f}, "
-        f"required complete samples={result.policy['required_complete_samples']}"
+        f"required flow samples={result.policy['required_complete_samples']}; "
+        f"fixed temporal samples={result.policy['temporal_samples']}"
     )
     lines.append("")
     for hop in result.hops:
@@ -59,6 +62,8 @@ def render_text(result: TraceResult, verbose: bool = False) -> str:
             )
         if hop.mutations:
             evidence.append("mutation " + ",".join(hop.mutations))
+        if hop.sent and hop.answered < hop.sent:
+            evidence.append(f"ICMP replies {hop.answered}/{hop.sent}")
         if evidence:
             line += "  [" + "; ".join(evidence) + "]"
         lines.append(line)
@@ -75,20 +80,33 @@ def render_text(result: TraceResult, verbose: bool = False) -> str:
             arrow = "=>" if segment.type == SegmentType.OPAQUE else "->"
             boundaries = f"{segment.ingress or '?'} {arrow} {segment.egress or '?'}"
             certificate = segment.certificate
-            status = "CERTIFIED" if certificate.certified else "BUDGET-LIMITED"
             lines.append(
                 f"  TTL {segment.first_ttl}-{segment.last_ttl}  "
                 f"{segment.type.value.upper():<10} {boundaries}"
             )
             if segment.explicit_mechanism:
                 lines.append(f"    explicit evidence: {segment.explicit_mechanism}")
-            lines.append(
-                f"    coverage: {status}; n={certificate.sample_count}, "
-                f"P(miss behavior with p>={certificate.min_detectable_probability:.3f}) "
-                f"<={certificate.miss_probability_bound:.4f}"
-            )
+            if certificate.method == "flow_variant_coverage":
+                status = "CERTIFIED" if certificate.certified else "BUDGET-LIMITED"
+                lines.append(
+                    f"    flow coverage: {status}; n={certificate.sample_count}/"
+                    f"{certificate.required_sample_count}, "
+                    f"P(miss behavior with p>={certificate.min_detectable_probability:.3f}) "
+                    f"<={certificate.miss_probability_bound:.4f}"
+                )
+            else:
+                status = "REPEATED" if certificate.certified else "PARTIAL"
+                lines.append(
+                    f"    fixed-flow evidence: {status}; n={certificate.sample_count}/"
+                    f"{certificate.required_sample_count} temporal samples; "
+                    "no cross-flow coverage claim"
+                )
             if segment.empirical_stability is not None:
-                lines.append(f"    fixed-flow empirical stability: {segment.empirical_stability:.3f}")
+                lines.append(
+                    f"    fixed-flow responder stability: {segment.empirical_stability:.3f}"
+                )
+            if segment.response_rate is not None:
+                lines.append(f"    fixed-flow ICMP response rate: {segment.response_rate:.3f}")
             for reason in segment.reasons:
                 lines.append(f"    - {reason}")
             if verbose:
@@ -101,10 +119,16 @@ def render_text(result: TraceResult, verbose: bool = False) -> str:
         lines.append("Behavior boundaries: none detected")
 
     lines.append("")
+    if result.reached:
+        reachability = "destination reached"
+    elif result.termination:
+        reachability = "destination not confirmed; " + _format_termination(result)
+    else:
+        reachability = "destination not reached (no terminal response)"
     lines.append(
         f"probes: {result.probe_count} total = {result.baseline_probe_count} baseline + "
         f"{result.adaptive_probe_count} adaptive; duration {result.duration_ms:.1f} ms; "
-        f"destination {'reached' if result.reached else 'not reached'}"
+        f"{reachability}"
     )
     for warning in result.warnings:
         lines.append(f"warning: {warning}")
@@ -117,3 +141,33 @@ def render_text(result: TraceResult, verbose: bool = False) -> str:
 
 def _format_outcomes(outcomes: object) -> str:
     return "; ".join(f"{signature} x{count}" for signature, count in outcomes)  # type: ignore[misc]
+
+
+_UNREACHABLE_CODES = {
+    0: "network unreachable",
+    1: "host unreachable",
+    2: "protocol unreachable",
+    3: "port unreachable",
+    4: "fragmentation needed",
+    5: "source route failed",
+    9: "network administratively prohibited",
+    10: "host administratively prohibited",
+    13: "communication administratively prohibited",
+}
+
+
+def _format_termination(result: TraceResult) -> str:
+    termination = result.termination
+    if termination is None:
+        return "no terminal response"
+    if termination.kind == ReplyKind.UNREACHABLE and termination.icmp_type == 3:
+        detail = _UNREACHABLE_CODES.get(
+            termination.icmp_code,
+            f"unreachable code {termination.icmp_code}",
+        )
+    else:
+        detail = termination.kind.value.replace("_", " ")
+    return (
+        f"terminal ICMP {detail} at TTL {termination.ttl} from "
+        f"{termination.responder or '?'}"
+    )

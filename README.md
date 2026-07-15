@@ -31,6 +31,10 @@ flows when identifying probes. StrataTrace instead:
 - records address, port, and DSCP/ECN mutation visible in the ICMP quotation;
 - returns an auditable coverage certificate rather than an unexplained
   confidence score;
+- separates forwarding-responder changes from intermittent ICMP visibility, so
+  control-plane rate limiting is not mislabeled as path instability;
+- localizes a persistent quoted-header rewrite to the TTL where its mutation
+  profile first changes instead of marking every downstream hop mutable;
 - emits structured JSON for measurement pipelines.
 
 The behavior model is not tied to satellite networks or to MPLS. It applies to
@@ -126,6 +130,7 @@ opening sockets:
 ```bash
 make demo-opaque
 make demo-ecmp
+make demo-realistic
 ```
 
 Or directly:
@@ -140,21 +145,33 @@ PYTHONPATH=src python3 -m stratatrace \
 ```text
 TTL 2-4  OPAQUE  10.0.1.1 => 203.0.113.9
   explicit evidence: MPLS (RFC 4950 label-stack evidence)
-  coverage: CERTIFIED; n=9,
-            P(miss behavior with p>=0.25) <=0.0751
+  flow coverage: CERTIFIED; n=9/9,
+                 P(miss behavior with p>=0.25) <=0.0751
 ```
 
 - `DIRECT`: adjacent fixed-flow TTL observations agree.
 - `MULTIPATH`: controlled flow variants produce multiple signatures while the
   fixed-flow signature remains stable.
-- `UNSTABLE`: the same fixed flow changes over the measurement window.
+- `UNSTABLE`: the same fixed flow produces different responder addresses over
+  the measurement window; timeouts alone never trigger this class.
+- `INTERMITTENT`: ICMP visibility changes, but every received response still
+  identifies the same forwarding responder. This is evidence about response
+  behavior, not proof of forwarding loss or route change.
 - `MUTABLE`: the ICMP quotation reveals changed address, port, or DSCP/ECN fields.
 - `OPAQUE`: sampled TTL positions remain unobservable between visible
   boundaries.
 - `UNKNOWN`: the evidence or probe budget cannot support a stronger class.
 
-`CERTIFIED` describes *detection coverage*, not the probability that a guessed
+`CERTIFIED` is printed only for flow-variant CAP coverage. Mutation and
+same-flow temporal observations instead report `fixed-flow evidence` and make
+no cross-flow coverage claim. Neither label is the probability that a guessed
 physical topology is true. See [docs/ALGORITHM.md](docs/ALGORITHM.md).
+
+When a UDP trace has visible hops but receives no terminal ICMP response, the
+destination may be silently filtering that traffic class. StrataTrace reports
+this as unconfirmed rather than treating the last visible router as the target.
+Run a separate `--protocol icmp` trace for comparison; the two traffic classes
+are never spliced into one path.
 
 ## Test and verify
 
@@ -201,6 +218,7 @@ These are measurement-model boundaries, not hidden caveats.
 - [RFC 4884 — Extended ICMP to Support Multi-Part Messages](https://www.rfc-editor.org/rfc/rfc4884.html)
 - [RFC 4950 — ICMP Extensions for MPLS](https://www.rfc-editor.org/rfc/rfc4950.html)
 - [RFC 5837 — Interface and Next-Hop Identification](https://www.rfc-editor.org/rfc/rfc5837.html)
+- [RFC 1812 — Requirements for IP Version 4 Routers](https://www.rfc-editor.org/rfc/rfc1812.html)
 - [IANA IPv4 Special-Purpose Address Registry](https://www.iana.org/assignments/iana-ipv4-special-registry/iana-ipv4-special-registry.xhtml)
 - [RFC 2544 — Network Interconnect Device Benchmarking](https://www.rfc-editor.org/rfc/rfc2544.html)
 - [Paris traceroute publications](https://paris-traceroute.net/publications/)

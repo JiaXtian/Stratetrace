@@ -25,6 +25,7 @@ class SegmentType(str, Enum):
     MULTIPATH = "multipath"
     OPAQUE = "opaque"
     MUTABLE = "mutable"
+    INTERMITTENT = "intermittent"
     UNSTABLE = "unstable"
     UNKNOWN = "unknown"
 
@@ -125,6 +126,7 @@ class BoundaryRegion:
     last_ttl: int
     probe_ttls: Tuple[int, ...]
     reasons: Tuple[str, ...]
+    variant_coverage: bool = False
 
 
 @dataclass(frozen=True)
@@ -136,6 +138,8 @@ class SegmentCertificate:
     miss_probability_bound: float
     requested_miss_probability: float
     certified: bool
+    method: str = "flow_variant_coverage"
+    required_sample_count: int = 0
     assumptions: Tuple[str, ...] = (
         "forwarding behavior is stationary during the measurement window",
         "flow variants are uniform samples without replacement from the configured token space",
@@ -152,6 +156,7 @@ class SegmentSummary:
     fixed_outcomes: Tuple[Tuple[str, int], ...]
     varied_outcomes: Tuple[Tuple[str, int], ...]
     empirical_stability: Optional[float]
+    response_rate: Optional[float]
     certificate: SegmentCertificate
     reasons: Tuple[str, ...]
     explicit_mechanism: Optional[str] = None
@@ -175,6 +180,9 @@ class TraceResult:
     observations: List[ProbeObservation] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
     policy: Dict[str, Any] = field(default_factory=dict)
+    termination: Optional["TerminationSummary"] = None
+    probed_max_ttl: int = 0
+    interrupted: bool = False
 
     def to_dict(self, include_observations: bool = True) -> Dict[str, Any]:
         raw = asdict(self)
@@ -182,6 +190,15 @@ class TraceResult:
         if not include_observations:
             raw.pop("observations", None)
         return _enum_values(raw)
+
+
+@dataclass(frozen=True)
+class TerminationSummary:
+    ttl: int
+    kind: ReplyKind
+    responder: Optional[str]
+    icmp_type: Optional[int]
+    icmp_code: Optional[int]
 
 
 def _enum_values(value: Any) -> Any:

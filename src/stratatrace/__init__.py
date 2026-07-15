@@ -4,4 +4,4 @@ from .controller import TraceConfig, TraceController
 from .model import SegmentType, TraceResult
 
 __all__ = ["SegmentType", "TraceConfig", "TraceController", "TraceResult"]
-__version__ = "0.1.1"
+__version__ = "0.2.0"

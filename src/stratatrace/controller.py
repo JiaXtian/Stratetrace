@@ -23,6 +23,7 @@ from .model import (
     SegmentCertificate,
     SegmentSummary,
     SegmentType,
+    TerminationSummary,
     TraceResult,
 )
 from .stats import miss_probability_bound, required_samples, validate_probability
@@ -35,9 +36,12 @@ class TraceConfig:
     timeout: float = 1.0
     pacing_ms: float = 1.0
     baseline_rounds: int = 2
+    temporal_samples: int = 3
     canary_flows: int = 1
     global_cap: bool = False
     chunk_size: int = 8
+    adaptive_batch_samples: int = 4
+    tail_guard_hops: int = 3
     min_detectable_probability: float = 0.25
     miss_probability: float = 0.10
     max_probes: int = 512
@@ -55,10 +59,16 @@ class TraceConfig:
             raise ValueError("pacing_ms must be between 0 and 1000")
         if not 1 <= self.baseline_rounds <= 20:
             raise ValueError("baseline_rounds must be between 1 and 20")
+        if not 2 <= self.temporal_samples <= 20:
+            raise ValueError("temporal_samples must be between 2 and 20")
         if not 0 <= self.canary_flows <= 20:
             raise ValueError("canary_flows must be between 0 and 20")
         if not 1 <= self.chunk_size <= 64:
             raise ValueError("chunk_size must be between 1 and 64")
+        if not 1 <= self.adaptive_batch_samples <= 32:
+            raise ValueError("adaptive_batch_samples must be between 1 and 32")
+        if not 0 <= self.tail_guard_hops <= 32:
+            raise ValueError("tail_guard_hops must be between 0 and 32")
         if not 1 <= self.max_probes <= 100_000:
             raise ValueError("max_probes must be between 1 and 100000")
         if not 1 <= self.destination_port <= 65535:
@@ -97,42 +107,73 @@ class TraceController:
         started_wall = datetime.now(timezone.utc).isoformat()
         started = time.monotonic_ns()
         main_flow = self._main_flow()
-        terminal_ttl = self._baseline(main_flow)
-        analysis_limit = terminal_ttl or self._last_observed_ttl() or self.config.max_hops
-        baseline_answered = any(
-            item.answered and item.spec.phase == "baseline-fixed"
-            for item in self.observations
-        )
-        if baseline_answered:
-            self._flow_canaries(main_flow, analysis_limit)
-            regions = self._find_regions(analysis_limit)
-        else:
-            regions = []
         required = required_samples(
             self.config.min_detectable_probability, self.config.miss_probability
         )
-        if self.config.global_cap and baseline_answered:
-            global_region = BoundaryRegion(
-                1,
-                analysis_limit,
-                tuple(range(1, analysis_limit + 1)),
-                ("global CAP coverage requested",),
+        regions: List[BoundaryRegion] = []
+        interrupted = False
+        try:
+            self._baseline(main_flow)
+            analysis_limit = self._analysis_limit(main_flow)
+            baseline_answered = self._baseline_answered()
+            if baseline_answered:
+                self._flow_canaries(main_flow, analysis_limit)
+                regions = self._find_regions(analysis_limit)
+            if self.config.global_cap and baseline_answered:
+                regions = [
+                    BoundaryRegion(
+                        1,
+                        analysis_limit,
+                        tuple(range(1, analysis_limit + 1)),
+                        ("global CAP coverage requested",),
+                        variant_coverage=True,
+                    )
+                ]
+            for region in regions:
+                self._probe_region(region, main_flow, required)
+        except KeyboardInterrupt:
+            interrupted = True
+            self.warnings.append(
+                "Measurement interrupted by the user; this is a partial, non-certified result."
             )
-            regions = [global_region]
-        for region in regions:
-            self._probe_region(region, main_flow, required)
+
+        analysis_limit = self._analysis_limit(main_flow)
+        baseline_answered = self._baseline_answered()
+        if interrupted and baseline_answered and not regions:
+            regions = self._find_regions(analysis_limit)
         duration_ms = (time.monotonic_ns() - started) / 1_000_000.0
-        reached_ttls = [
-            item.spec.ttl
-            for item in self.observations
-            if item.kind == ReplyKind.DESTINATION and item.spec.flow == main_flow
+        terminals = sorted(
+            (
+                item
+                for item in self.observations
+                if item.terminal and item.spec.flow == main_flow
+            ),
+            key=lambda item: (item.spec.ttl, item.sent_ns),
+        )
+        destination_terminals = [
+            item for item in terminals if item.kind == ReplyKind.DESTINATION
         ]
-        reached = bool(reached_ttls)
-        stop_ttl = min(reached_ttls) if reached_ttls else terminal_ttl
-        if not regions and baseline_answered:
+        reached = bool(destination_terminals)
+        terminal_observation = terminals[0] if terminals else None
+        stop_ttl = terminal_observation.spec.ttl if terminal_observation else None
+        if destination_terminals:
+            confirmed = destination_terminals[0]
+            if confirmed.responder and confirmed.responder != self.backend.destination:
+                self.warnings.append(
+                    f"The terminal response came from {confirmed.responder}, not the selected "
+                    f"destination address {self.backend.destination}. This can be valid behind "
+                    "NAT/load balancing, but it confirms the probed flow rather than endpoint identity."
+                )
+        if not regions and baseline_answered and not interrupted:
             self.warnings.append(
                 "No ambiguous boundary was found; clear hops remain rapid-sweep observations, "
                 "not CAP-certified stable edges."
+            )
+        if baseline_answered and not terminals and not interrupted:
+            self.warnings.append(
+                "No terminal ICMP response was received. The target may silently filter the "
+                "selected traffic class; the last visible responder is not proof that the "
+                "destination was reached. Try --protocol icmp as a separate diagnostic trace."
             )
         hops = self._summarize_hops(stop_ttl or analysis_limit, main_flow)
         segments = self._summarize_segments(regions, hops, required)
@@ -163,13 +204,43 @@ class TraceController:
                 "required_complete_samples": required,
                 "max_probes": self.config.max_probes,
                 "baseline_rounds": self.config.baseline_rounds,
+                "temporal_samples": self.config.temporal_samples,
                 "canary_flows": self.config.canary_flows,
                 "global_cap": self.config.global_cap,
                 "flow_identity": main_flow.token,
             },
+            termination=(
+                TerminationSummary(
+                    ttl=terminal_observation.spec.ttl,
+                    kind=terminal_observation.kind,
+                    responder=terminal_observation.responder,
+                    icmp_type=terminal_observation.icmp_type,
+                    icmp_code=terminal_observation.icmp_code,
+                )
+                if terminal_observation
+                else None
+            ),
+            probed_max_ttl=max((item.spec.ttl for item in self.observations), default=0),
+            interrupted=interrupted,
         )
         self.backend.close()
         return result
+
+    def _baseline_answered(self) -> bool:
+        return any(
+            item.answered and item.spec.phase == "baseline-fixed"
+            for item in self.observations
+        )
+
+    def _analysis_limit(self, main_flow: FlowKey) -> int:
+        terminal_ttls = [
+            item.spec.ttl
+            for item in self.observations
+            if item.terminal and item.spec.flow == main_flow
+        ]
+        if terminal_ttls:
+            return min(terminal_ttls)
+        return self._last_observed_ttl() or self.config.max_hops
 
     def _main_flow(self) -> FlowKey:
         if self.config.protocol == ProbeProtocol.UDP:
@@ -234,7 +305,21 @@ class TraceController:
         terminal_ttl: Optional[int] = None
         for round_index in range(self.config.baseline_rounds):
             round_start = len(self.observations)
-            sweep_limit = terminal_ttl or self.config.max_hops
+            if terminal_ttl is not None:
+                sweep_limit = terminal_ttl
+            elif round_index == 0:
+                # The first sweep preserves classic traceroute coverage.  Later
+                # repeats need only cover the already visible range plus a small
+                # guard; probing the known-silent tail again adds no DBP evidence.
+                sweep_limit = self.config.max_hops
+            else:
+                last_visible = self._last_observed_ttl()
+                sweep_limit = min(
+                    self.config.max_hops,
+                    (last_visible + self.config.tail_guard_hops)
+                    if last_visible is not None
+                    else self.config.max_hops,
+                )
             sample_id = self._new_sample_id()
             for start in range(1, sweep_limit + 1, self.config.chunk_size):
                 stop = min(start + self.config.chunk_size - 1, sweep_limit)
@@ -308,27 +393,57 @@ class TraceController:
             elif item.spec.phase == "canary-varied" and item.spec.ttl <= limit:
                 canary_by_ttl[item.spec.ttl].append(item)
         suspicious: Dict[int, List[str]] = {}
+        mutation_profiles: Dict[int, frozenset] = {}
         for ttl in range(1, limit + 1):
             samples = by_ttl.get(ttl, [])
             responders = {item.responder for item in samples if item.responder}
             reasons = []
-            if samples and any(not item.answered for item in samples):
-                reasons.append("missing response")
+            combined = samples + canary_by_ttl.get(ttl, [])
+            if combined and any(item.answered for item in combined) and any(
+                not item.answered for item in combined
+            ):
+                reasons.append("intermittent response visibility")
+            elif combined and all(not item.answered for item in combined):
+                reasons.append("unobservable TTL")
             if len(responders) > 1:
-                reasons.append("same-flow temporal variation")
-            if any(item.mutations for item in samples):
-                reasons.append("quoted-header mutation")
-            fixed_primary = Counter(item.responder for item in samples if item.responder).most_common(1)
-            fixed_address = fixed_primary[0][0] if fixed_primary else None
+                reasons.append("same-flow responder variation")
+            mutation_profiles[ttl] = frozenset(
+                mutation for item in samples if item.answered for mutation in item.mutations
+            )
+            fixed_addresses = {item.responder for item in samples if item.responder}
             canary_addresses = {
                 item.responder for item in canary_by_ttl.get(ttl, []) if item.responder
             }
-            if canary_addresses and (len(canary_addresses) > 1 or fixed_address not in canary_addresses):
-                reasons.append("flow-sensitive response")
-            if any(not item.answered for item in canary_by_ttl.get(ttl, [])) and fixed_address:
-                reasons.append("flow-sensitive loss")
+            # A canary choosing one member of an already time-varying fixed
+            # set is not evidence of flow sensitivity.  Require a new canary
+            # responder, or disagreement with an otherwise stable fixed flow.
+            if (
+                fixed_addresses
+                and canary_addresses
+                and (
+                    bool(canary_addresses - fixed_addresses)
+                    or (len(fixed_addresses) == 1 and fixed_addresses != canary_addresses)
+                )
+            ):
+                reasons.append("flow-sensitive responder")
+            fixed_visible = bool(fixed_addresses)
+            canary_visible = bool(canary_addresses)
+            if samples and canary_by_ttl.get(ttl) and fixed_visible != canary_visible:
+                reasons.append("flow-sensitive visibility")
             if reasons:
                 suspicious[ttl] = reasons
+
+        # Header rewrites persist downstream.  Repeating "mutation" at every
+        # later hop creates a giant false boundary, so mark only the point where
+        # the quoted-header profile changes relative to the previous visible TTL.
+        previous_profile: frozenset = frozenset()
+        for ttl in range(1, limit + 1):
+            if not any(item.answered for item in by_ttl.get(ttl, [])):
+                continue
+            profile = mutation_profiles[ttl]
+            if profile != previous_profile:
+                suspicious.setdefault(ttl, []).append("quoted-header mutation boundary")
+            previous_profile = profile
         if not suspicious:
             return []
         groups: List[List[int]] = []
@@ -347,12 +462,30 @@ class TraceController:
                 midpoint = (first + last) // 2
                 probe_ttls = tuple(sorted({first, first + 1, midpoint, last - 1, last}))
             reasons = tuple(sorted({reason for ttl in group for reason in suspicious[ttl]}))
-            regions.append(BoundaryRegion(first, last, probe_ttls, reasons))
+            variant_coverage = self.config.global_cap or any(
+                reason
+                in {
+                    "intermittent response visibility",
+                    "unobservable TTL",
+                    "flow-sensitive responder",
+                    "flow-sensitive visibility",
+                }
+                for reason in reasons
+            )
+            regions.append(
+                BoundaryRegion(
+                    first,
+                    last,
+                    probe_ttls,
+                    reasons,
+                    variant_coverage=variant_coverage,
+                )
+            )
         return regions
 
     def _probe_region(self, region: BoundaryRegion, main_flow: FlowKey, required: int) -> None:
         existing_fixed = self._complete_sample_count(region.probe_ttls, variant=False)
-        for _ in range(max(0, required - existing_fixed)):
+        for _ in range(max(0, self.config.temporal_samples - existing_fixed)):
             sample_id = self._new_sample_id()
             specs = [
                 ProbeSpec(
@@ -366,22 +499,40 @@ class TraceController:
             ]
             if not self._send(specs):
                 return
+        if not region.variant_coverage:
+            return
         existing_varied = self._complete_sample_count(region.probe_ttls, variant=True)
-        for variant in range(existing_varied + 1, required + 1):
-            sample_id = self._new_sample_id()
-            flow = self._variant_flow(variant, main_flow)
-            specs = [
-                ProbeSpec(
-                    ttl=ttl,
-                    flow=flow,
-                    phase="dbp-varied",
-                    sample_id=sample_id,
-                    payload_size=self.config.payload_size,
+        next_variant = existing_varied + 1
+        while next_variant <= required:
+            remaining_slots = self.config.max_probes - len(self.observations)
+            capacity = remaining_slots // len(region.probe_ttls)
+            sample_count = min(
+                self.config.adaptive_batch_samples,
+                required - next_variant + 1,
+                capacity,
+            )
+            if sample_count <= 0:
+                self.warnings.append(
+                    "Probe budget exhausted before another complete flow-variant bundle."
                 )
-                for ttl in region.probe_ttls
-            ]
+                return
+            specs = []
+            for variant in range(next_variant, next_variant + sample_count):
+                sample_id = self._new_sample_id()
+                flow = self._variant_flow(variant, main_flow)
+                specs.extend(
+                    ProbeSpec(
+                        ttl=ttl,
+                        flow=flow,
+                        phase="dbp-varied",
+                        sample_id=sample_id,
+                        payload_size=self.config.payload_size,
+                    )
+                    for ttl in region.probe_ttls
+                )
             if not self._send(specs):
                 return
+            next_variant += sample_count
 
     def _complete_sample_count(self, ttls: Sequence[int], variant: bool) -> int:
         expected = set(ttls)
@@ -460,12 +611,21 @@ class TraceController:
                     fixed_outcomes=((f"{left.primary}->{right.primary}", samples),),
                     varied_outcomes=(),
                     empirical_stability=1.0 if samples else None,
+                    response_rate=min(
+                        1.0 - left.loss_rate,
+                        1.0 - right.loss_rate,
+                    ),
                     certificate=SegmentCertificate(
                         sample_count=samples,
                         min_detectable_probability=self.config.min_detectable_probability,
                         miss_probability_bound=bound,
                         requested_miss_probability=self.config.miss_probability,
                         certified=samples >= required,
+                        method="rapid_sweep_observation",
+                        required_sample_count=required,
+                        assumptions=(
+                            "adjacent replies are observations of the fixed flow in the measurement window",
+                        ),
                     ),
                     reasons=("adjacent TTL responses from the fixed target flow",),
                 )
@@ -489,9 +649,21 @@ class TraceController:
         varied_signatures = self._sample_signatures(varied, region.probe_ttls)
         fixed_counts = Counter(fixed_signatures.values())
         varied_counts = Counter(varied_signatures.values())
+        fixed_answered = [item for item in fixed if item.answered]
+        fixed_response_rate = len(fixed_answered) / len(fixed) if fixed else None
+        fixed_responder_total = 0
+        fixed_responder_modal = 0
+        for ttl in region.probe_ttls:
+            counts = Counter(
+                item.responder
+                for item in fixed
+                if item.spec.ttl == ttl and item.responder is not None
+            )
+            fixed_responder_total += sum(counts.values())
+            fixed_responder_modal += counts.most_common(1)[0][1] if counts else 0
         fixed_stability = (
-            fixed_counts.most_common(1)[0][1] / len(fixed_signatures)
-            if fixed_signatures
+            fixed_responder_modal / fixed_responder_total
+            if fixed_responder_total
             else None
         )
         always_missing = []
@@ -499,7 +671,17 @@ class TraceController:
             samples = [item for item in fixed + varied if item.spec.ttl == ttl]
             if samples and all(not item.answered for item in samples):
                 always_missing.append(ttl)
-        fixed_variation = len(fixed_counts) > 1
+        fixed_responder_variation = any(
+            len(
+                {
+                    item.responder
+                    for item in fixed
+                    if item.spec.ttl == ttl and item.responder is not None
+                }
+            )
+            > 1
+            for ttl in region.probe_ttls
+        )
         varied_variation = len(varied_counts) > 1
         varied_responder_multipath = any(
             len(
@@ -514,6 +696,11 @@ class TraceController:
         )
         mutations = sorted({mutation for item in fixed + varied for mutation in item.mutations})
         fully_answered = bool(fixed and varied) and all(item.answered for item in fixed + varied)
+        intermittent_visibility = any(
+            any(item.answered for item in fixed + varied if item.spec.ttl == ttl)
+            and any(not item.answered for item in fixed + varied if item.spec.ttl == ttl)
+            for ttl in region.probe_ttls
+        )
         labels = [
             label
             for item in fixed + varied
@@ -522,9 +709,9 @@ class TraceController:
         ]
 
         reasons = list(region.reasons)
-        if fixed_variation:
+        if fixed_responder_variation:
             segment_type = SegmentType.UNSTABLE
-            reasons.append("the same flow produced multiple response signatures over time")
+            reasons.append("the same flow produced multiple responder addresses over time")
         elif varied_responder_multipath:
             segment_type = SegmentType.MULTIPATH
             reasons.append("controlled flow-token variants produced multiple stable signatures")
@@ -533,13 +720,13 @@ class TraceController:
             reasons.append(
                 "one or more sampled TTL positions remained unobservable between visible boundaries"
             )
-        elif mutations:
+        elif "quoted-header mutation boundary" in region.reasons and mutations:
             segment_type = SegmentType.MUTABLE
-            reasons.append("the quoted invoking packet differs from the sent flow")
-        elif varied_variation:
-            segment_type = SegmentType.UNKNOWN
+            reasons.append("the quoted invoking-packet header profile changes at this boundary")
+        elif intermittent_visibility or varied_variation:
+            segment_type = SegmentType.INTERMITTENT
             reasons.append(
-                "flow variants changed response/loss behavior without revealing multiple responders"
+                "ICMP response visibility changed without evidence of a different forwarding responder"
             )
         elif (
             fully_answered
@@ -554,7 +741,35 @@ class TraceController:
             reasons.append("available evidence does not identify a stable behavior class")
 
         varied_samples = len(varied_signatures)
-        bound = miss_probability_bound(self.config.min_detectable_probability, varied_samples)
+        fixed_samples = len(fixed_signatures)
+        if region.variant_coverage:
+            certificate_samples = varied_samples
+            certificate_required = required
+            certificate_method = "flow_variant_coverage"
+            bound = miss_probability_bound(
+                self.config.min_detectable_probability, certificate_samples
+            )
+            certified = (
+                fixed_samples >= self.config.temporal_samples
+                and certificate_samples >= certificate_required
+                and bound <= self.config.miss_probability
+            )
+            assumptions = (
+                "forwarding behavior is stationary during the measurement window",
+                "flow variants are uniform samples without replacement from the configured token space",
+            )
+        else:
+            certificate_samples = fixed_samples
+            certificate_required = self.config.temporal_samples
+            certificate_method = "fixed_flow_repeatability"
+            bound = miss_probability_bound(
+                self.config.min_detectable_probability, certificate_samples
+            )
+            certified = certificate_samples >= certificate_required
+            assumptions = (
+                "repeated observations describe this fixed flow only",
+                "the result is evidence of observed behavior, not undiscovered-flow coverage",
+            )
         explicit = "MPLS (RFC 4950 label-stack evidence)" if labels else None
         if explicit:
             reasons.append("an ICMP extension explicitly carried an MPLS label stack")
@@ -569,12 +784,16 @@ class TraceController:
             fixed_outcomes=tuple(fixed_counts.most_common()),
             varied_outcomes=tuple(varied_counts.most_common()),
             empirical_stability=fixed_stability,
+            response_rate=fixed_response_rate,
             certificate=SegmentCertificate(
-                sample_count=varied_samples,
+                sample_count=certificate_samples,
                 min_detectable_probability=self.config.min_detectable_probability,
                 miss_probability_bound=bound,
                 requested_miss_probability=self.config.miss_probability,
-                certified=varied_samples >= required and bound <= self.config.miss_probability,
+                certified=certified,
+                method=certificate_method,
+                required_sample_count=certificate_required,
+                assumptions=assumptions,
             ),
             reasons=tuple(dict.fromkeys(reasons)),
             explicit_mechanism=explicit,

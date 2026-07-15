@@ -15,9 +15,9 @@ from .report import render_json, render_text
 
 
 PROFILES = {
-    "fast": {"p": 0.50, "delta": 0.20, "rounds": 1, "max_probes": 256},
-    "default": {"p": 0.25, "delta": 0.10, "rounds": 2, "max_probes": 512},
-    "thorough": {"p": 0.10, "delta": 0.01, "rounds": 3, "max_probes": 4096},
+    "fast": {"p": 0.50, "delta": 0.20, "rounds": 1, "temporal": 2, "max_probes": 256},
+    "default": {"p": 0.25, "delta": 0.10, "rounds": 2, "temporal": 3, "max_probes": 512},
+    "thorough": {"p": 0.10, "delta": 0.01, "rounds": 3, "temporal": 5, "max_probes": 4096},
 }
 
 
@@ -61,7 +61,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="delta: maximum modeled probability of missing behavior >= p_min",
     )
     parser.add_argument("--baseline-rounds", type=int)
+    parser.add_argument(
+        "--temporal-samples",
+        type=int,
+        help="fixed-flow repeat target for local behavior evidence",
+    )
     parser.add_argument("--canary-flows", type=int, default=1)
+    parser.add_argument(
+        "--tail-guard-hops",
+        type=int,
+        default=3,
+        help="silent TTL guard retained in baseline repeats (default: 3)",
+    )
     parser.add_argument(
         "--global-cap",
         action="store_true",
@@ -99,7 +110,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if args.baseline_rounds is not None
             else int(profile["rounds"])
         ),
+        temporal_samples=(
+            args.temporal_samples
+            if args.temporal_samples is not None
+            else int(profile["temporal"])
+        ),
         canary_flows=args.canary_flows,
+        tail_guard_hops=args.tail_guard_hops,
         global_cap=args.global_cap,
         min_detectable_probability=(
             args.min_detectable_prob
@@ -136,6 +153,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(render_json(result, include_observations=args.include_observations))
         else:
             print(render_text(result, verbose=args.verbose))
+        if result.interrupted:
+            return 130
         return 0 if result.reached else 1
     except PrivilegeError as exc:
         print(f"stratatrace: permission error: {exc}", file=sys.stderr)

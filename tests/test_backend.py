@@ -42,7 +42,7 @@ class BackendEvidenceTests(unittest.TestCase):
         )
         mutations = self.backend._mutations(parsed, self.flow)
         self.assertEqual(len(mutations), 5)
-        self.assertIn("dscp-ecn:0->32", mutations)
+        self.assertIn("dscp:0->8", mutations)
 
     def test_rfc2544_fake_ip_addresses_are_diagnosed(self):
         diagnostic = benchmark_address_diagnostic("198.18.6.85", "198.18.0.1")
