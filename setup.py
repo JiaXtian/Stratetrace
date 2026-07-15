@@ -5,7 +5,7 @@ from setuptools import find_packages, setup
 
 setup(
     name="stratatrace",
-    version="0.2.0",
+    version="0.4.0",
     description="Boundary-aware, confidence-bounded adaptive traceroute",
     long_description=open("README.md", encoding="utf-8").read(),
     long_description_content_type="text/markdown",

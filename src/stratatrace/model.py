@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 class ProbeProtocol(str, Enum):
     UDP = "udp"
     ICMP = "icmp"
+    TCP = "tcp"
 
 
 class ReplyKind(str, Enum):
@@ -26,6 +27,7 @@ class SegmentType(str, Enum):
     OPAQUE = "opaque"
     MUTABLE = "mutable"
     INTERMITTENT = "intermittent"
+    SILENT_TAIL = "silent_tail"
     UNSTABLE = "unstable"
     UNKNOWN = "unknown"
 
@@ -42,8 +44,11 @@ class FlowKey:
 
     @property
     def token(self) -> str:
-        if self.protocol == ProbeProtocol.UDP:
-            return f"udp:{self.source_port}:{self.destination_port}:v{self.variant}"
+        if self.protocol in (ProbeProtocol.UDP, ProbeProtocol.TCP):
+            return (
+                f"{self.protocol.value}:{self.source_port}:"
+                f"{self.destination_port}:v{self.variant}"
+            )
         return f"icmp:{self.icmp_identifier}:v{self.variant}"
 
 
@@ -98,6 +103,7 @@ class ProbeObservation:
     extensions: Optional[ExtensionEvidence] = None
     mutations: Tuple[str, ...] = ()
     matched_by: str = "ip_id"
+    tcp_flags: Optional[int] = None
 
     @property
     def answered(self) -> bool:
@@ -127,6 +133,7 @@ class BoundaryRegion:
     probe_ttls: Tuple[int, ...]
     reasons: Tuple[str, ...]
     variant_coverage: bool = False
+    family: str = "mixed"
 
 
 @dataclass(frozen=True)
@@ -160,6 +167,7 @@ class SegmentSummary:
     certificate: SegmentCertificate
     reasons: Tuple[str, ...]
     explicit_mechanism: Optional[str] = None
+    branches: Tuple[Tuple[int, Tuple[Tuple[str, int], ...]], ...] = ()
 
 
 @dataclass
@@ -199,6 +207,7 @@ class TerminationSummary:
     responder: Optional[str]
     icmp_type: Optional[int]
     icmp_code: Optional[int]
+    tcp_flags: Optional[int] = None
 
 
 def _enum_values(value: Any) -> Any:

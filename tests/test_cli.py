@@ -58,6 +58,50 @@ class CliTests(unittest.TestCase):
         self.assertTrue(document["reached"])
         self.assertNotIn("observations", document)
 
+    def test_tcp_defaults_to_https_and_reports_direct_tcp_termination(self):
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            status = main(
+                [
+                    "--simulate",
+                    str(FIXTURES / "transparent.json"),
+                    "--protocol",
+                    "tcp",
+                    "--max-hops",
+                    "8",
+                    "--json",
+                    "example.invalid",
+                ]
+            )
+        self.assertEqual(status, 0)
+        document = json.loads(stdout.getvalue())
+        self.assertEqual(document["protocol"], "tcp")
+        self.assertEqual(document["policy"]["destination_port"], 443)
+        self.assertEqual(document["policy"]["tcp_syn_profile"], "standard")
+        self.assertEqual(document["termination"]["tcp_flags"], 0x12)
+
+    def test_tcp_minimal_profile_is_recorded_in_policy(self):
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            status = main(
+                [
+                    "--simulate",
+                    str(FIXTURES / "transparent.json"),
+                    "--protocol",
+                    "tcp",
+                    "--tcp-syn-profile",
+                    "minimal",
+                    "--max-hops",
+                    "8",
+                    "--json",
+                    "example.invalid",
+                ]
+            )
+        self.assertEqual(status, 0)
+        self.assertEqual(
+            json.loads(stdout.getvalue())["policy"]["tcp_syn_profile"], "minimal"
+        )
+
     def test_invalid_probability_is_rejected(self):
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):

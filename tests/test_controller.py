@@ -52,6 +52,29 @@ class ControllerTests(unittest.TestCase):
         self.assertTrue(result.segments)
         self.assertTrue(all(item.type == SegmentType.DIRECT for item in result.segments))
 
+    def test_open_ended_silence_is_reported_without_false_opaque_claim(self):
+        result = run_scenario("silent_tail")
+        silent = [
+            item for item in result.segments if item.type == SegmentType.SILENT_TAIL
+        ]
+        self.assertEqual(len(silent), 1)
+        self.assertEqual((silent[0].first_ttl, silent[0].last_ttl), (3, 8))
+        self.assertEqual(silent[0].ingress, "10.0.2.1")
+        self.assertIsNone(silent[0].egress)
+        self.assertFalse(silent[0].certificate.certified)
+        self.assertEqual(silent[0].certificate.method, "silent_tail_observation")
+        self.assertNotIn(SegmentType.OPAQUE, {item.type for item in result.segments})
+        self.assertEqual(result.adaptive_probe_count, 0)
+
+    def test_persistent_silence_and_intermittent_visibility_are_separate_claims(self):
+        result = run_scenario("split_visibility")
+        types = {item.type for item in result.segments}
+        self.assertIn(SegmentType.INTERMITTENT, types)
+        self.assertIn(SegmentType.OPAQUE, types)
+        opaque = next(item for item in result.segments if item.type == SegmentType.OPAQUE)
+        self.assertEqual(opaque.certificate.method, "flow_variant_coverage")
+        self.assertTrue(opaque.certificate.certified)
+
     def test_zero_response_stops_after_one_sweep_without_false_direct_segment(self):
         result = run_scenario("all_timeout")
         self.assertFalse(result.reached)
@@ -114,8 +137,16 @@ class ControllerTests(unittest.TestCase):
         self.assertNotIn(SegmentType.UNSTABLE, types)
         self.assertIn(SegmentType.MUTABLE, types)
         self.assertIn(SegmentType.INTERMITTENT, types)
+        self.assertIn(SegmentType.MULTIPATH, types)
         mutation = next(item for item in result.segments if item.type == SegmentType.MUTABLE)
         self.assertEqual((mutation.first_ttl, mutation.last_ttl), (10, 12))
+        multipath = next(
+            item for item in result.segments if item.type == SegmentType.MULTIPATH
+        )
+        self.assertEqual((multipath.first_ttl, multipath.last_ttl), (11, 13))
+        self.assertEqual(multipath.branches[0][0], 12)
+        self.assertEqual(len(multipath.branches[0][1]), 2)
+        self.assertIsNotNone(multipath.ingress)
         intermittent = [
             item for item in result.segments if item.type == SegmentType.INTERMITTENT
         ]

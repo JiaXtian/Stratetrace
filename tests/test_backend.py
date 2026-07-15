@@ -23,6 +23,18 @@ class BackendEvidenceTests(unittest.TestCase):
         )
         self.assertTrue(self.backend._matches_flow(parsed, self.flow))
 
+    def test_direct_tcp_reply_is_correlated_by_reversed_ports_and_ack_session(self):
+        flow = FlowKey(ProbeProtocol.TCP, 53000, 443)
+        parsed = SimpleNamespace(
+            direct_protocol=socket.IPPROTO_TCP,
+            direct_source_port=443,
+            direct_destination_port=53000,
+            session_verified=True,
+        )
+        self.assertTrue(self.backend._matches_flow(parsed, flow))
+        parsed.direct_destination_port = 53001
+        self.assertFalse(self.backend._matches_flow(parsed, flow))
+
     def test_minimum_quote_requires_original_destination_flow(self):
         parsed = SimpleNamespace(
             quoted_protocol=socket.IPPROTO_UDP,

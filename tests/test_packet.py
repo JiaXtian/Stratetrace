@@ -5,13 +5,19 @@ import unittest
 from stratatrace.model import ReplyKind
 from stratatrace.packet import (
     ICMP_STABLE_CHECKSUM,
+    TCP_FLAG_ACK,
+    TCP_FLAG_RST,
+    TCP_FLAG_SYN,
     _ipv4_header,
     build_icmp_echo_probe,
+    build_tcp_syn_probe,
     build_udp_probe,
     internet_checksum,
     parse_icmp_response,
     parse_ipv4,
+    parse_tcp_response,
     prepare_for_raw_socket,
+    tcp_probe_sequence,
 )
 
 
@@ -52,7 +58,91 @@ def icmp_error(original, icmp_type=11, code=0, extensions=b""):
     return _ipv4_header(ROUTER, SOURCE, socket.IPPROTO_ICMP, 57, 99, len(body)) + body
 
 
+def tcp_reply(original, flags):
+    original_ip = parse_ipv4(original)
+    source_port, destination_port, sequence = struct.unpack_from(
+        "!HHI", original_ip.payload, 0
+    )
+    offset_and_flags = (5 << 12) | flags
+    tcp = struct.pack(
+        "!HHIIHHHH",
+        destination_port,
+        source_port,
+        12345,
+        (sequence + 1) & 0xFFFFFFFF,
+        offset_and_flags,
+        65535,
+        0,
+        0,
+    )
+    return _ipv4_header(TARGET, SOURCE, socket.IPPROTO_TCP, 51, 100, len(tcp)) + tcp
+
+
 class PacketTests(unittest.TestCase):
+    def test_tcp_syn_probe_has_valid_checksum_and_correlatable_sequence(self):
+        packet = build_tcp_syn_probe(SOURCE, TARGET, 53000, 443, 5, 81, SESSION)
+        ip = parse_ipv4(packet)
+        self.assertEqual(ip.protocol, socket.IPPROTO_TCP)
+        source_port, destination_port, sequence = struct.unpack_from("!HHI", ip.payload)
+        self.assertEqual((source_port, destination_port), (53000, 443))
+        self.assertEqual(sequence, tcp_probe_sequence(SESSION, 81))
+        pseudo = struct.pack(
+            "!4s4sBBH",
+            socket.inet_aton(SOURCE),
+            socket.inet_aton(TARGET),
+            0,
+            socket.IPPROTO_TCP,
+            len(ip.payload),
+        )
+        self.assertEqual(internet_checksum(pseudo + ip.payload), 0)
+        self.assertEqual(len(ip.payload), 40)
+        self.assertEqual((struct.unpack_from("!H", ip.payload, 12)[0] >> 12), 10)
+        self.assertEqual(ip.payload[20:24], b"\x02\x04\x05\xb4")
+
+    def test_minimal_tcp_syn_profile_remains_available(self):
+        packet = build_tcp_syn_probe(
+            SOURCE, TARGET, 53000, 443, 5, 81, SESSION, "minimal"
+        )
+        ip = parse_ipv4(packet)
+        self.assertEqual(len(ip.payload), 20)
+        self.assertEqual((struct.unpack_from("!H", ip.payload, 12)[0] >> 12), 5)
+
+    def test_invalid_tcp_syn_profile_is_rejected(self):
+        with self.assertRaises(ValueError):
+            build_tcp_syn_probe(
+                SOURCE, TARGET, 53000, 443, 5, 81, SESSION, "not-a-profile"
+            )
+
+    def test_minimum_icmp_quote_correlates_tcp_sequence(self):
+        original = build_tcp_syn_probe(SOURCE, TARGET, 53000, 443, 5, 82, SESSION)
+        parsed = parse_icmp_response(icmp_error(original), SESSION)
+        self.assertEqual(parsed.probe_id, 82)
+        self.assertTrue(parsed.session_verified)
+        self.assertEqual(parsed.quoted_protocol, socket.IPPROTO_TCP)
+        self.assertEqual(parsed.quoted_tcp_sequence, tcp_probe_sequence(SESSION, 82))
+
+    def test_tcp_syn_ack_and_rst_ack_mark_destination(self):
+        original = build_tcp_syn_probe(SOURCE, TARGET, 53000, 443, 5, 83, SESSION)
+        syn_ack = parse_tcp_response(
+            tcp_reply(original, TCP_FLAG_SYN | TCP_FLAG_ACK), SESSION
+        )
+        rst_ack = parse_tcp_response(
+            tcp_reply(original, TCP_FLAG_RST | TCP_FLAG_ACK), SESSION
+        )
+        self.assertEqual(syn_ack.probe_id, 83)
+        self.assertEqual(syn_ack.kind, ReplyKind.DESTINATION)
+        self.assertTrue(syn_ack.terminal)
+        self.assertEqual(rst_ack.tcp_flags, TCP_FLAG_RST | TCP_FLAG_ACK)
+
+    def test_unacknowledged_or_wrong_session_tcp_is_rejected(self):
+        original = build_tcp_syn_probe(SOURCE, TARGET, 53000, 443, 5, 84, SESSION)
+        with self.assertRaises(ValueError):
+            parse_tcp_response(tcp_reply(original, TCP_FLAG_RST), SESSION)
+        with self.assertRaises(ValueError):
+            parse_tcp_response(
+                tcp_reply(original, TCP_FLAG_SYN | TCP_FLAG_ACK), SESSION ^ 1
+            )
+
     def test_udp_probe_is_valid_and_flow_fields_are_fixed(self):
         first = build_udp_probe(SOURCE, TARGET, 53000, 33434, 3, 10, SESSION)
         second = build_udp_probe(SOURCE, TARGET, 53000, 33434, 4, 11, SESSION)

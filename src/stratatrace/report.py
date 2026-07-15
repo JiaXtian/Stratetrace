@@ -21,9 +21,13 @@ def render_text(result: TraceResult, verbose: bool = False) -> str:
     lines: List[str] = []
     span = f", TTL 1-{result.probed_max_ttl} probed" if result.probed_max_ttl > len(result.hops) else ""
     partial = ", PARTIAL" if result.interrupted else ""
+    destination_port = result.policy.get("destination_port")
+    traffic_class = result.protocol.value.upper()
+    if destination_port:
+        traffic_class += f"/{destination_port}"
     lines.append(
         f"StrataTrace to {result.target} ({result.destination}) from {result.source}, "
-        f"{result.protocol.value.upper()}, {len(result.hops)} hops analyzed{span}{partial}"
+        f"{traffic_class}, {len(result.hops)} TTL positions analyzed{span}{partial}"
     )
     lines.append(
         f"policy: p_min={result.policy['min_detectable_probability']:.3f}, "
@@ -31,6 +35,8 @@ def render_text(result: TraceResult, verbose: bool = False) -> str:
         f"required flow samples={result.policy['required_complete_samples']}; "
         f"fixed temporal samples={result.policy['temporal_samples']}"
     )
+    if result.protocol.value == "tcp":
+        lines[-1] += f"; TCP SYN profile={result.policy.get('tcp_syn_profile', 'standard')}"
     lines.append("")
     for hop in result.hops:
         if hop.primary is None:
@@ -77,7 +83,13 @@ def render_text(result: TraceResult, verbose: bool = False) -> str:
         lines.append("")
         lines.append("Behavior boundaries:")
         for segment in special:
-            arrow = "=>" if segment.type == SegmentType.OPAQUE else "->"
+            arrow = (
+                "=>"
+                if segment.type == SegmentType.OPAQUE
+                else "~>"
+                if segment.type == SegmentType.SILENT_TAIL
+                else "->"
+            )
             boundaries = f"{segment.ingress or '?'} {arrow} {segment.egress or '?'}"
             certificate = segment.certificate
             lines.append(
@@ -86,7 +98,12 @@ def render_text(result: TraceResult, verbose: bool = False) -> str:
             )
             if segment.explicit_mechanism:
                 lines.append(f"    explicit evidence: {segment.explicit_mechanism}")
-            if certificate.method == "flow_variant_coverage":
+            if certificate.method == "silent_tail_observation":
+                lines.append(
+                    f"    tail evidence: OBSERVED; n={certificate.sample_count} complete "
+                    "fixed-flow sweep(s); open-ended/no egress, so no CAP certification"
+                )
+            elif certificate.method == "flow_variant_coverage":
                 status = "CERTIFIED" if certificate.certified else "BUDGET-LIMITED"
                 lines.append(
                     f"    flow coverage: {status}; n={certificate.sample_count}/"
@@ -106,7 +123,14 @@ def render_text(result: TraceResult, verbose: bool = False) -> str:
                     f"    fixed-flow responder stability: {segment.empirical_stability:.3f}"
                 )
             if segment.response_rate is not None:
-                lines.append(f"    fixed-flow ICMP response rate: {segment.response_rate:.3f}")
+                lines.append(f"    fixed-flow response rate: {segment.response_rate:.3f}")
+            for ttl, responders in segment.branches:
+                lines.append(
+                    f"    TTL {ttl} branches: "
+                    + ", ".join(
+                        f"{address} x{count}" for address, count in responders
+                    )
+                )
             for reason in segment.reasons:
                 lines.append(f"    - {reason}")
             if verbose:
@@ -121,6 +145,8 @@ def render_text(result: TraceResult, verbose: bool = False) -> str:
     lines.append("")
     if result.reached:
         reachability = "destination reached"
+        if result.termination and result.termination.tcp_flags is not None:
+            reachability += " (" + _tcp_flag_name(result.termination.tcp_flags) + ")"
     elif result.termination:
         reachability = "destination not confirmed; " + _format_termination(result)
     else:
@@ -136,6 +162,11 @@ def render_text(result: TraceResult, verbose: bool = False) -> str:
         "note: OPAQUE means a repeatable observation gap between visible boundaries; "
         "it does not, by itself, identify hidden devices or a tunnel protocol."
     )
+    if any(item.type == SegmentType.SILENT_TAIL for item in result.segments):
+        lines.append(
+            "note: SILENT_TAIL means probes continued beyond the last visible responder "
+            "without a visible egress; it is not evidence that those TTLs are router hops."
+        )
     return "\n".join(lines)
 
 
@@ -171,3 +202,11 @@ def _format_termination(result: TraceResult) -> str:
         f"terminal ICMP {detail} at TTL {termination.ttl} from "
         f"{termination.responder or '?'}"
     )
+
+
+def _tcp_flag_name(flags: int) -> str:
+    if flags & 0x04:
+        return "TCP RST-ACK"
+    if flags & 0x02 and flags & 0x10:
+        return "TCP SYN-ACK"
+    return f"TCP flags=0x{flags:02x}"

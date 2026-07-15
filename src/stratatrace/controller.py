@@ -47,6 +47,7 @@ class TraceConfig:
     max_probes: int = 512
     destination_port: int = 33434
     source_port: Optional[int] = None
+    tcp_syn_profile: str = "standard"
     seed: Optional[int] = None
     payload_size: int = 32
 
@@ -75,6 +76,8 @@ class TraceConfig:
             raise ValueError("destination_port must be between 1 and 65535")
         if self.source_port is not None and not 1 <= self.source_port <= 65535:
             raise ValueError("source_port must be between 1 and 65535")
+        if self.tcp_syn_profile not in {"standard", "minimal"}:
+            raise ValueError("tcp_syn_profile must be 'standard' or 'minimal'")
         if self.payload_size < 16 or self.payload_size > 1400:
             raise ValueError("payload_size must be between 16 and 1400")
         validate_probability(self.min_detectable_probability, "min_detectable_probability")
@@ -127,10 +130,10 @@ class TraceController:
                         tuple(range(1, analysis_limit + 1)),
                         ("global CAP coverage requested",),
                         variant_coverage=True,
+                        family="global",
                     )
                 ]
-            for region in regions:
-                self._probe_region(region, main_flow, required)
+            self._probe_regions(regions, main_flow, required)
         except KeyboardInterrupt:
             interrupted = True
             self.warnings.append(
@@ -156,6 +159,12 @@ class TraceController:
         reached = bool(destination_terminals)
         terminal_observation = terminals[0] if terminals else None
         stop_ttl = terminal_observation.spec.ttl if terminal_observation else None
+        probed_max_ttl = max((item.spec.ttl for item in self.observations), default=0)
+        has_silent_tail = bool(
+            baseline_answered
+            and not terminals
+            and analysis_limit < probed_max_ttl
+        )
         if destination_terminals:
             confirmed = destination_terminals[0]
             if confirmed.responder and confirmed.responder != self.backend.destination:
@@ -164,19 +173,28 @@ class TraceController:
                     f"destination address {self.backend.destination}. This can be valid behind "
                     "NAT/load balancing, but it confirms the probed flow rather than endpoint identity."
                 )
-        if not regions and baseline_answered and not interrupted:
+        if not regions and baseline_answered and not interrupted and not has_silent_tail:
             self.warnings.append(
                 "No ambiguous boundary was found; clear hops remain rapid-sweep observations, "
                 "not CAP-certified stable edges."
             )
         if baseline_answered and not terminals and not interrupted:
+            if self.config.protocol == ProbeProtocol.UDP:
+                comparison = "Try --protocol tcp --dport 443 and --protocol icmp"
+            elif self.config.protocol == ProbeProtocol.TCP:
+                comparison = "Try --protocol icmp and a separate UDP trace"
+            else:
+                comparison = "Try --protocol tcp --dport 443 and a separate UDP trace"
             self.warnings.append(
-                "No terminal ICMP response was received. The target may silently filter the "
+                "No terminal response was received. The target may silently filter the "
                 "selected traffic class; the last visible responder is not proof that the "
-                "destination was reached. Try --protocol icmp as a separate diagnostic trace."
+                f"destination was reached. {comparison} as separate diagnostic traces."
             )
         hops = self._summarize_hops(stop_ttl or analysis_limit, main_flow)
         segments = self._summarize_segments(regions, hops, required)
+        if has_silent_tail:
+            segments.append(self._summarize_silent_tail(analysis_limit, probed_max_ttl, hops))
+            segments.sort(key=lambda item: (item.first_ttl, item.last_ttl, item.type.value))
         adaptive = len(self.observations) - self.baseline_probe_count
         result = TraceResult(
             target=target,
@@ -208,6 +226,16 @@ class TraceController:
                 "canary_flows": self.config.canary_flows,
                 "global_cap": self.config.global_cap,
                 "flow_identity": main_flow.token,
+                "destination_port": (
+                    main_flow.destination_port
+                    if main_flow.protocol in (ProbeProtocol.UDP, ProbeProtocol.TCP)
+                    else None
+                ),
+                "tcp_syn_profile": (
+                    self.config.tcp_syn_profile
+                    if self.config.protocol == ProbeProtocol.TCP
+                    else None
+                ),
             },
             termination=(
                 TerminationSummary(
@@ -216,11 +244,12 @@ class TraceController:
                     responder=terminal_observation.responder,
                     icmp_type=terminal_observation.icmp_type,
                     icmp_code=terminal_observation.icmp_code,
+                    tcp_flags=terminal_observation.tcp_flags,
                 )
                 if terminal_observation
                 else None
             ),
-            probed_max_ttl=max((item.spec.ttl for item in self.observations), default=0),
+            probed_max_ttl=probed_max_ttl,
             interrupted=interrupted,
         )
         self.backend.close()
@@ -243,10 +272,10 @@ class TraceController:
         return self._last_observed_ttl() or self.config.max_hops
 
     def _main_flow(self) -> FlowKey:
-        if self.config.protocol == ProbeProtocol.UDP:
+        if self.config.protocol in (ProbeProtocol.UDP, ProbeProtocol.TCP):
             source_port = self.config.source_port or self.random.randrange(49152, 65536)
             return FlowKey(
-                protocol=ProbeProtocol.UDP,
+                protocol=self.config.protocol,
                 source_port=source_port,
                 destination_port=self.config.destination_port,
             )
@@ -259,7 +288,7 @@ class TraceController:
         cached = self._variant_cache.get(variant)
         if cached is not None:
             return cached
-        if main.protocol == ProbeProtocol.UDP:
+        if main.protocol in (ProbeProtocol.UDP, ProbeProtocol.TCP):
             while True:
                 source_port = self.random.randrange(49152, 65536)
                 if source_port != main.source_port and source_port not in self._used_variant_values:
@@ -346,8 +375,13 @@ class TraceController:
                     break
             round_observations = self.observations[round_start:]
             if round_index == 0 and not any(item.answered for item in round_observations):
+                response_kind = (
+                    "correlated ICMP/TCP response"
+                    if self.config.protocol == ProbeProtocol.TCP
+                    else "ICMP response"
+                )
                 self.warnings.append(
-                    "No ICMP response was received during the first complete fixed-flow "
+                    f"No {response_kind} was received during the first complete fixed-flow "
                     "sweep. DBP/CAP was skipped because no visible boundary exists to "
                     "analyze. Check VPN/TUN routing, host/network firewalls, raw-socket "
                     "packet format, and target reachability."
@@ -446,42 +480,66 @@ class TraceController:
             previous_profile = profile
         if not suspicious:
             return []
-        groups: List[List[int]] = []
-        for ttl in sorted(suspicious):
-            if not groups or ttl > groups[-1][-1] + 1:
-                groups.append([ttl])
-            else:
-                groups[-1].append(ttl)
+        reason_family = {
+            # These observations require different claims.  In particular, a
+            # persistent silent run can support OPAQUE only when it has visible
+            # boundaries, while partial ICMP visibility remains INTERMITTENT.
+            "intermittent response visibility": "visibility_intermittent",
+            "unobservable TTL": "visibility_silent",
+            "flow-sensitive visibility": "visibility_flow",
+            "flow-sensitive responder": "multipath",
+            "same-flow responder variation": "temporal",
+            "quoted-header mutation boundary": "mutation",
+        }
+        by_family: DefaultDict[str, Dict[int, List[str]]] = defaultdict(dict)
+        for ttl, reasons in suspicious.items():
+            for reason in reasons:
+                family = reason_family[reason]
+                by_family[family].setdefault(ttl, []).append(reason)
+
         regions = []
-        for group in groups:
-            first = max(1, group[0] - 1)
-            last = min(limit, group[-1] + 1)
-            if last - first + 1 <= 7:
-                probe_ttls = tuple(range(first, last + 1))
-            else:
-                midpoint = (first + last) // 2
-                probe_ttls = tuple(sorted({first, first + 1, midpoint, last - 1, last}))
-            reasons = tuple(sorted({reason for ttl in group for reason in suspicious[ttl]}))
-            variant_coverage = self.config.global_cap or any(
-                reason
-                in {
-                    "intermittent response visibility",
-                    "unobservable TTL",
-                    "flow-sensitive responder",
-                    "flow-sensitive visibility",
-                }
-                for reason in reasons
-            )
-            regions.append(
-                BoundaryRegion(
-                    first,
-                    last,
-                    probe_ttls,
-                    reasons,
-                    variant_coverage=variant_coverage,
+        for family, family_suspicious in by_family.items():
+            groups: List[List[int]] = []
+            for ttl in sorted(family_suspicious):
+                if not groups or ttl > groups[-1][-1] + 1:
+                    groups.append([ttl])
+                else:
+                    groups[-1].append(ttl)
+            for group in groups:
+                first = max(1, group[0] - 1)
+                last = min(limit, group[-1] + 1)
+                if last - first + 1 <= 7:
+                    probe_ttls = tuple(range(first, last + 1))
+                else:
+                    midpoint = (first + last) // 2
+                    probe_ttls = tuple(
+                        sorted({first, first + 1, midpoint, last - 1, last})
+                    )
+                reasons = tuple(
+                    sorted(
+                        {
+                            reason
+                            for ttl in group
+                            for reason in family_suspicious[ttl]
+                        }
+                    )
                 )
-            )
-        return regions
+                regions.append(
+                    BoundaryRegion(
+                        first,
+                        last,
+                        probe_ttls,
+                        reasons,
+                        variant_coverage=(
+                            family.startswith("visibility_") or family == "multipath"
+                        ),
+                        family=family,
+                    )
+                )
+        return sorted(
+            regions,
+            key=lambda item: (item.first_ttl, item.last_ttl, item.family),
+        )
 
     def _probe_region(self, region: BoundaryRegion, main_flow: FlowKey, required: int) -> None:
         existing_fixed = self._complete_sample_count(region.probe_ttls, variant=False)
@@ -533,6 +591,49 @@ class TraceController:
             if not self._send(specs):
                 return
             next_variant += sample_count
+
+    def _probe_regions(
+        self,
+        regions: Sequence[BoundaryRegion],
+        main_flow: FlowKey,
+        required: int,
+    ) -> None:
+        """Share complete bundles across overlapping cross-flow regions."""
+
+        variant_regions = sorted(
+            (item for item in regions if item.variant_coverage),
+            key=lambda item: (item.first_ttl, item.last_ttl),
+        )
+        clusters: List[List[BoundaryRegion]] = []
+        for region in variant_regions:
+            if (
+                not clusters
+                or region.first_ttl > max(item.last_ttl for item in clusters[-1])
+            ):
+                clusters.append([region])
+            else:
+                clusters[-1].append(region)
+        for cluster in clusters:
+            probe_ttls = tuple(
+                sorted({ttl for item in cluster for ttl in item.probe_ttls})
+            )
+            aggregate = BoundaryRegion(
+                first_ttl=min(item.first_ttl for item in cluster),
+                last_ttl=max(item.last_ttl for item in cluster),
+                probe_ttls=probe_ttls,
+                reasons=("shared adaptive sampling window",),
+                variant_coverage=True,
+                family="sampling",
+            )
+            self._probe_region(aggregate, main_flow, required)
+
+        # Fixed-only regions run after shared CAP windows so their temporal
+        # sample count can reuse any aggregate sample that covers the same TTLs.
+        for region in sorted(
+            (item for item in regions if not item.variant_coverage),
+            key=lambda item: (item.first_ttl, item.last_ttl),
+        ):
+            self._probe_region(region, main_flow, required)
 
     def _complete_sample_count(self, ttls: Sequence[int], variant: bool) -> int:
         expected = set(ttls)
@@ -632,6 +733,55 @@ class TraceController:
             )
         return sorted(direct + special, key=lambda item: (item.first_ttl, item.last_ttl))
 
+    def _summarize_silent_tail(
+        self,
+        last_visible_ttl: int,
+        probed_max_ttl: int,
+        hops: Sequence[HopSummary],
+    ) -> SegmentSummary:
+        """Represent open-ended silence without inventing an opaque egress.
+
+        A visible ingress followed by timeouts through max TTL is useful
+        evidence, but it is observationally compatible with filtering,
+        rate-limiting, a protocol policy, or a path longer than the configured
+        limit.  It therefore cannot be certified as an OPAQUE segment.
+        """
+
+        tail_ttls = tuple(range(last_visible_ttl + 1, probed_max_ttl + 1))
+        complete_sweeps = self._complete_sample_count(tail_ttls, variant=False)
+        ingress = self._nearest_visible(hops, last_visible_ttl, direction=-1)
+        return SegmentSummary(
+            type=SegmentType.SILENT_TAIL,
+            first_ttl=last_visible_ttl,
+            last_ttl=probed_max_ttl,
+            ingress=ingress,
+            egress=None,
+            fixed_outcomes=(),
+            varied_outcomes=(),
+            empirical_stability=None,
+            response_rate=0.0,
+            certificate=SegmentCertificate(
+                sample_count=complete_sweeps,
+                min_detectable_probability=self.config.min_detectable_probability,
+                # Fixed-flow silence without an egress has no cross-flow CAP
+                # guarantee.  Use the vacuous bound in machine-readable output
+                # instead of exposing an easy-to-misread numerical claim.
+                miss_probability_bound=1.0,
+                requested_miss_probability=self.config.miss_probability,
+                certified=False,
+                method="silent_tail_observation",
+                required_sample_count=self.config.temporal_samples,
+                assumptions=(
+                    "no response was observed in the complete fixed-flow tail sweep",
+                    "there is no visible egress boundary from which to infer internal structure",
+                ),
+            ),
+            reasons=(
+                "no response was observed after the last visible TTL through the configured maximum",
+                "open-ended silence is not an OPAQUE segment and does not identify a filtering or tunneling mechanism",
+            ),
+        )
+
     def _classify_region(
         self, region: BoundaryRegion, hops: Sequence[HopSummary], required: int
     ) -> SegmentSummary:
@@ -694,6 +844,15 @@ class TraceController:
             > 1
             for ttl in region.probe_ttls
         )
+        branches = []
+        for ttl in region.probe_ttls:
+            counts = Counter(
+                item.responder
+                for item in varied
+                if item.spec.ttl == ttl and item.responder is not None
+            )
+            if len(counts) > 1:
+                branches.append((ttl, tuple(counts.most_common())))
         mutations = sorted({mutation for item in fixed + varied for mutation in item.mutations})
         fully_answered = bool(fixed and varied) and all(item.answered for item in fixed + varied)
         intermittent_visibility = any(
@@ -709,7 +868,32 @@ class TraceController:
         ]
 
         reasons = list(region.reasons)
-        if fixed_responder_variation:
+        if region.family == "temporal" and fixed_responder_variation:
+            segment_type = SegmentType.UNSTABLE
+            reasons.append("the same flow produced multiple responder addresses over time")
+        elif region.family == "multipath" and varied_responder_multipath:
+            segment_type = SegmentType.MULTIPATH
+            reasons.append("controlled flow-token variants produced multiple stable signatures")
+        elif (
+            region.family == "visibility_silent"
+            and always_missing
+            and self._has_visible_boundaries(region, hops)
+        ):
+            segment_type = SegmentType.OPAQUE
+            reasons.append(
+                "one or more sampled TTL positions remained unobservable between visible boundaries"
+            )
+        elif region.family == "mutation" and mutations:
+            segment_type = SegmentType.MUTABLE
+            reasons.append("the quoted invoking-packet header profile changes at this boundary")
+        elif region.family.startswith("visibility_") and (
+            intermittent_visibility or varied_variation or bool(always_missing)
+        ):
+            segment_type = SegmentType.INTERMITTENT
+            reasons.append(
+                "ICMP response visibility changed without evidence of a different forwarding responder"
+            )
+        elif fixed_responder_variation:
             segment_type = SegmentType.UNSTABLE
             reasons.append("the same flow produced multiple responder addresses over time")
         elif varied_responder_multipath:
@@ -773,8 +957,8 @@ class TraceController:
         explicit = "MPLS (RFC 4950 label-stack evidence)" if labels else None
         if explicit:
             reasons.append("an ICMP extension explicitly carried an MPLS label stack")
-        ingress = hops[region.first_ttl - 1].primary if region.first_ttl <= len(hops) else None
-        egress = hops[region.last_ttl - 1].primary if region.last_ttl <= len(hops) else None
+        ingress = self._nearest_visible(hops, region.first_ttl, direction=-1)
+        egress = self._nearest_visible(hops, region.last_ttl, direction=1)
         return SegmentSummary(
             type=segment_type,
             first_ttl=region.first_ttl,
@@ -797,6 +981,7 @@ class TraceController:
             ),
             reasons=tuple(dict.fromkeys(reasons)),
             explicit_mechanism=explicit,
+            branches=tuple(branches) if segment_type == SegmentType.MULTIPATH else (),
         )
 
     @staticmethod
@@ -821,3 +1006,20 @@ class TraceController:
             and hops[region.first_ttl - 1].primary is not None
             and hops[region.last_ttl - 1].primary is not None
         )
+
+    @staticmethod
+    def _nearest_visible(
+        hops: Sequence[HopSummary], ttl: int, direction: int
+    ) -> Optional[str]:
+        if not hops:
+            return None
+        start = min(max(ttl, 1), len(hops))
+        indexes = (
+            range(start - 1, -1, -1)
+            if direction < 0
+            else range(start - 1, len(hops))
+        )
+        for index in indexes:
+            if hops[index].primary:
+                return hops[index].primary
+        return None

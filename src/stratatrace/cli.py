@@ -40,8 +40,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-m", "--max-hops", type=int, default=30)
     parser.add_argument("-w", "--timeout", type=float, default=1.0, help="batch receive timeout in seconds")
     parser.add_argument("--pacing-ms", type=float, default=1.0, help="delay between probes in a matched batch")
-    parser.add_argument("--dport", type=int, default=33434, help="fixed UDP destination port")
-    parser.add_argument("--sport", type=int, help="fixed UDP source port")
+    parser.add_argument(
+        "--dport",
+        type=int,
+        help="fixed destination port (default: UDP 33434, TCP 443)",
+    )
+    parser.add_argument("--sport", type=int, help="fixed UDP/TCP source port")
+    parser.add_argument(
+        "--tcp-syn-profile",
+        choices=("standard", "minimal"),
+        default="standard",
+        help=(
+            "TCP SYN shape: standard uses common MSS/SACK/timestamp/window-scale "
+            "options; minimal sends a bare SYN (default: standard)"
+        ),
+    )
     parser.add_argument("--source", help="explicit IPv4 source address")
     parser.add_argument(
         "--allow-benchmark-address",
@@ -100,8 +113,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     profile = PROFILES[args.profile]
+    protocol = ProbeProtocol(args.protocol)
+    destination_port = (
+        args.dport
+        if args.dport is not None
+        else 443
+        if protocol == ProbeProtocol.TCP
+        else 33434
+    )
     config = TraceConfig(
-        protocol=ProbeProtocol(args.protocol),
+        protocol=protocol,
         max_hops=args.max_hops,
         timeout=args.timeout,
         pacing_ms=args.pacing_ms,
@@ -129,8 +150,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         max_probes=(
             args.max_probes if args.max_probes is not None else int(profile["max_probes"])
         ),
-        destination_port=args.dport,
+        destination_port=destination_port,
         source_port=args.sport,
+        tcp_syn_profile=args.tcp_syn_profile,
         seed=args.seed,
         payload_size=args.payload_size,
     )
@@ -147,6 +169,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 timeout=config.timeout,
                 pacing_ms=config.pacing_ms,
                 allow_benchmark_address=args.allow_benchmark_address,
+                protocol=config.protocol,
+                tcp_syn_profile=config.tcp_syn_profile,
             )
         result = TraceController(backend, config).run(args.target)
         if args.json:

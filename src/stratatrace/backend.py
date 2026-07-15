@@ -25,9 +25,12 @@ from .model import (
 from .packet import (
     PacketParseError,
     build_icmp_echo_probe,
+    build_tcp_syn_probe,
     build_udp_probe,
     parse_icmp_response,
+    parse_tcp_response,
     prepare_for_raw_socket,
+    tcp_probe_sequence,
 )
 
 
@@ -104,6 +107,8 @@ class RawIPv4Backend:
         pacing_ms: float = 1.0,
         session_id: Optional[int] = None,
         allow_benchmark_address: bool = False,
+        protocol: Optional[ProbeProtocol] = None,
+        tcp_syn_profile: str = "standard",
     ) -> None:
         self.destination = destination
         destination_diagnostic = benchmark_address_diagnostic(self.destination, "0.0.0.0")
@@ -115,6 +120,9 @@ class RawIPv4Backend:
             raise BackendError(diagnostic)
         self.timeout = timeout
         self.pacing_seconds = pacing_ms / 1000.0
+        if tcp_syn_profile not in {"standard", "minimal"}:
+            raise BackendError("tcp_syn_profile must be 'standard' or 'minimal'")
+        self.tcp_syn_profile = tcp_syn_profile
         self.session_id = session_id if session_id is not None else random.SystemRandom().getrandbits(32)
         self.probe_count = 0
         self._next_probe_id = random.SystemRandom().randrange(1, 65535)
@@ -123,6 +131,12 @@ class RawIPv4Backend:
             self._send.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
             self._receive = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
             self._receive.setblocking(False)
+            self._receive_tcp = None
+            if protocol == ProbeProtocol.TCP:
+                self._receive_tcp = socket.socket(
+                    socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP
+                )
+                self._receive_tcp.setblocking(False)
         except PermissionError as exc:
             self.close()
             raise PrivilegeError(
@@ -134,7 +148,7 @@ class RawIPv4Backend:
             raise BackendError(f"cannot initialize raw IPv4 sockets: {exc}") from exc
 
     def close(self) -> None:
-        for name in ("_send", "_receive"):
+        for name in ("_send", "_receive", "_receive_tcp"):
             sock = getattr(self, name, None)
             if sock is not None:
                 try:
@@ -165,6 +179,17 @@ class RawIPv4Backend:
                 self.session_id,
                 spec.payload_size,
             )
+        if spec.flow.protocol == ProbeProtocol.TCP:
+            return build_tcp_syn_probe(
+                self.source,
+                self.destination,
+                spec.flow.source_port,
+                spec.flow.destination_port,
+                spec.ttl,
+                spec.probe_id,
+                self.session_id,
+                self.tcp_syn_profile,
+            )
         return build_icmp_echo_probe(
             self.source,
             self.destination,
@@ -178,6 +203,17 @@ class RawIPv4Backend:
     def send_batch(self, specs: Sequence[ProbeSpec]) -> List[ProbeObservation]:
         if not specs:
             return []
+        if (
+            specs[0].flow.protocol == ProbeProtocol.TCP
+            and self._receive_tcp is None
+        ):
+            try:
+                self._receive_tcp = socket.socket(
+                    socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP
+                )
+                self._receive_tcp.setblocking(False)
+            except OSError as exc:
+                raise BackendError(f"cannot initialize TCP receive socket: {exc}") from exc
         outstanding: Dict[int, Tuple[ProbeSpec, int]] = {}
         observations: Dict[int, ProbeObservation] = {}
         for index, requested in enumerate(specs):
@@ -198,38 +234,59 @@ class RawIPv4Backend:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            readable, _, _ = select.select([self._receive], [], [], remaining)
+            receive_sockets = [self._receive]
+            if self._receive_tcp is not None:
+                receive_sockets.append(self._receive_tcp)
+            readable, _, _ = select.select(receive_sockets, [], [], remaining)
             if not readable:
                 break
-            try:
-                packet, address = self._receive.recvfrom(65535)
-                parsed = parse_icmp_response(packet, self.session_id, str(address[0]))
-            except (BlockingIOError, PacketParseError):
-                continue
-            pending = outstanding.get(parsed.probe_id)
-            if pending is None or parsed.probe_id in observations:
-                continue
-            spec, sent_ns = pending
-            if not self._matches_flow(parsed, spec.flow):
-                continue
-            received_ns = time.monotonic_ns()
-            mutations = self._mutations(parsed, spec.flow)
-            observations[parsed.probe_id] = ProbeObservation(
-                spec=spec,
-                kind=parsed.kind,
-                responder=parsed.responder,
-                rtt_ms=(received_ns - sent_ns) / 1_000_000.0,
-                sent_ns=sent_ns,
-                received_ns=received_ns,
-                reply_ttl=parsed.reply_ttl,
-                icmp_type=parsed.icmp_type,
-                icmp_code=parsed.icmp_code,
-                quoted_ttl=parsed.quoted_ttl,
-                terminal=parsed.terminal,
-                extensions=parsed.extensions,
-                mutations=mutations,
-                matched_by="payload_tag" if parsed.session_verified else "ip_id+flow",
-            )
+            for receive_socket in readable:
+                try:
+                    packet, address = receive_socket.recvfrom(65535)
+                    if receive_socket is self._receive_tcp:
+                        parsed = parse_tcp_response(packet, self.session_id)
+                    else:
+                        parsed = parse_icmp_response(
+                            packet, self.session_id, str(address[0])
+                        )
+                except (BlockingIOError, PacketParseError):
+                    continue
+                pending = outstanding.get(parsed.probe_id)
+                if pending is None or parsed.probe_id in observations:
+                    continue
+                spec, sent_ns = pending
+                if not self._matches_flow(parsed, spec.flow):
+                    continue
+                received_ns = time.monotonic_ns()
+                mutations = self._mutations(parsed, spec.flow, spec)
+                observations[parsed.probe_id] = ProbeObservation(
+                    spec=spec,
+                    kind=parsed.kind,
+                    responder=parsed.responder,
+                    rtt_ms=(received_ns - sent_ns) / 1_000_000.0,
+                    sent_ns=sent_ns,
+                    received_ns=received_ns,
+                    reply_ttl=parsed.reply_ttl,
+                    icmp_type=parsed.icmp_type,
+                    icmp_code=parsed.icmp_code,
+                    quoted_ttl=parsed.quoted_ttl,
+                    terminal=parsed.terminal,
+                    extensions=parsed.extensions,
+                    mutations=mutations,
+                    matched_by=(
+                        "tcp_ack"
+                        if parsed.direct_protocol == socket.IPPROTO_TCP
+                        else "tcp_sequence"
+                        if (
+                            parsed.quoted_protocol == socket.IPPROTO_TCP
+                            and parsed.session_verified
+                        )
+                        else "payload_tag"
+                        if parsed.session_verified
+                        else "ip_id+flow"
+                    ),
+                    tcp_flags=parsed.tcp_flags,
+                )
 
         result = []
         for probe_id, (spec, sent_ns) in outstanding.items():
@@ -248,10 +305,21 @@ class RawIPv4Backend:
         return result
 
     def _matches_flow(self, parsed: object, flow: FlowKey) -> bool:
+        if getattr(parsed, "direct_protocol", None) == socket.IPPROTO_TCP:
+            return (
+                flow.protocol == ProbeProtocol.TCP
+                and getattr(parsed, "direct_source_port") == flow.destination_port
+                and getattr(parsed, "direct_destination_port") == flow.source_port
+                and bool(getattr(parsed, "session_verified"))
+            )
         protocol = getattr(parsed, "quoted_protocol")
         if protocol is None:  # direct Echo Reply
             return flow.protocol == ProbeProtocol.ICMP
-        expected_protocol = socket.IPPROTO_UDP if flow.protocol == ProbeProtocol.UDP else socket.IPPROTO_ICMP
+        expected_protocol = {
+            ProbeProtocol.UDP: socket.IPPROTO_UDP,
+            ProbeProtocol.ICMP: socket.IPPROTO_ICMP,
+            ProbeProtocol.TCP: socket.IPPROTO_TCP,
+        }[flow.protocol]
         if protocol != expected_protocol:
             return False
         if getattr(parsed, "session_verified"):
@@ -260,14 +328,19 @@ class RawIPv4Backend:
             return True
         if getattr(parsed, "quoted_destination") != self.destination:
             return False
-        if flow.protocol == ProbeProtocol.UDP:
+        if flow.protocol in (ProbeProtocol.UDP, ProbeProtocol.TCP):
             # Permit source-port mutation so it can be reported, but require
             # the destination port to reject unrelated same-IP-ID traffic.
             return getattr(parsed, "quoted_destination_port") == flow.destination_port
         identifier = getattr(parsed, "quoted_icmp_identifier")
         return identifier is None or identifier == flow.icmp_identifier
 
-    def _mutations(self, parsed: object, flow: FlowKey) -> Tuple[str, ...]:
+    def _mutations(
+        self,
+        parsed: object,
+        flow: FlowKey,
+        spec: Optional[ProbeSpec] = None,
+    ) -> Tuple[str, ...]:
         mutations = []
         quoted_source = getattr(parsed, "quoted_source")
         if quoted_source is not None and quoted_source != self.source:
@@ -283,7 +356,7 @@ class RawIPv4Backend:
                 mutations.append(f"dscp:0->{quoted_dscp}")
             if quoted_ecn:
                 mutations.append(f"ecn:0->{quoted_ecn}")
-        if flow.protocol == ProbeProtocol.UDP:
+        if flow.protocol in (ProbeProtocol.UDP, ProbeProtocol.TCP):
             quoted_source_port = getattr(parsed, "quoted_source_port")
             if quoted_source_port is not None and quoted_source_port != flow.source_port:
                 mutations.append(f"source-port:{flow.source_port}->{quoted_source_port}")
@@ -295,6 +368,13 @@ class RawIPv4Backend:
                 mutations.append(
                     f"destination-port:{flow.destination_port}->{quoted_destination_port}"
                 )
+            if flow.protocol == ProbeProtocol.TCP and spec is not None:
+                quoted_sequence = getattr(parsed, "quoted_tcp_sequence", None)
+                expected_sequence = tcp_probe_sequence(self.session_id, spec.probe_id)
+                if quoted_sequence is not None and quoted_sequence != expected_sequence:
+                    mutations.append(
+                        f"tcp-sequence:{expected_sequence}->{quoted_sequence}"
+                    )
         else:
             quoted_identifier = getattr(parsed, "quoted_icmp_identifier")
             if quoted_identifier is not None and quoted_identifier != flow.icmp_identifier:
@@ -339,6 +419,7 @@ class ScriptedBackend:
             responder = str(outcome) if outcome is not None else None
             terminal = bool(rule.get("terminal", False) and responder)
             terminal_kind = ReplyKind(str(rule.get("terminal_kind", "destination")))
+            tcp_terminal = terminal and spec.flow.protocol == ProbeProtocol.TCP
             rtt_ms = float(rule.get("rtt_ms", spec.ttl)) if responder else None
             extensions = self._extensions(rule)
             mutations = tuple(str(item) for item in rule.get("mutations", []))
@@ -357,8 +438,11 @@ class ScriptedBackend:
                     sent_ns=now,
                     received_ns=now + int(rtt_ms * 1_000_000) if rtt_ms is not None else None,
                     reply_ttl=58 if responder else None,
-                    icmp_type=3 if terminal else 11 if responder else None,
+                    icmp_type=None if tcp_terminal else 3 if terminal else 11 if responder else None,
                     icmp_code=(
+                        None
+                        if tcp_terminal
+                        else
                         13
                         if terminal and terminal_kind == ReplyKind.UNREACHABLE
                         else 3
@@ -372,6 +456,9 @@ class ScriptedBackend:
                     extensions=extensions,
                     mutations=mutations,
                     matched_by="simulation",
+                    tcp_flags=(
+                        int(rule.get("tcp_flags", 0x12)) if tcp_terminal else None
+                    ),
                 )
             )
         return result

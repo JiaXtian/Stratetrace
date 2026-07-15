@@ -22,7 +22,7 @@ ICMP extension supplies explicit evidence.
 Classic traceroute assigns the same fixed probe count to every TTL and can mix
 flows when identifying probes. StrataTrace instead:
 
-- preserves one UDP five-tuple during a fixed-flow sweep;
+- preserves the target traffic-class flow key during a fixed-flow sweep;
 - sends matched TTL bundles close together to improve temporal coherence;
 - uses uniform flow-token variants (without replacement) to distinguish
   per-flow load balancing from same-flow temporal change;
@@ -35,6 +35,15 @@ flows when identifying probes. StrataTrace instead:
   control-plane rate limiting is not mislabeled as path instability;
 - localizes a persistent quoted-header rewrite to the TTL where its mutation
   profile first changes instead of marking every downstream hop mutable;
+- supports TCP SYN path measurement with direct SYN-ACK/RST-ACK termination,
+  using a fixed five-tuple and a sequence-based correlation key;
+- distinguishes persistent bounded silence from intermittent ICMP visibility,
+  and represents an unbounded post-path gap as `SILENT_TAIL` instead of
+  falsely calling it an opaque tunnel;
+- defaults to a host-like TCP SYN option profile while retaining a bare-SYN
+  compatibility profile for controlled A/B diagnosis;
+- separates overlapping visibility, mutation, temporal, and multipath evidence
+  into independent boundaries while sharing their adaptive probe bundles;
 - emits structured JSON for measurement pipelines.
 
 The behavior model is not tied to satellite networks or to MPLS. It applies to
@@ -73,6 +82,15 @@ sudo stratatrace example.com
 # ICMP Echo traffic class
 sudo stratatrace --protocol icmp example.com
 
+# TCP SYN toward the default HTTPS port; SYN-ACK and RST-ACK both confirm reachability
+sudo stratatrace --protocol tcp example.com
+
+# Trace the path seen by TCP port 80
+sudo stratatrace --protocol tcp --dport 80 example.com
+
+# A/B test a bare TCP SYN if a middlebox treats the default host-like SYN differently
+sudo stratatrace --protocol tcp --tcp-syn-profile minimal example.com
+
 # Lower-cost diagnosis
 sudo stratatrace --profile fast example.com
 
@@ -84,10 +102,12 @@ sudo stratatrace --global-cap --min-detectable-prob 0.10 \
 sudo stratatrace --json --include-observations example.com
 ```
 
-The fixed UDP destination port defaults to 33434. If that service is open at
-the destination, choose another closed port with `--dport`. UDP checksums are
-zero to preserve the flow identity while changing the correlation payload;
-this is valid for IPv4 but one reason this release does not claim IPv6 support.
+The fixed UDP destination port defaults to 33434. TCP defaults to port 443 and
+can target any explicit `--dport`. The default `standard` TCP SYN profile carries
+stable MSS, SACK-permitted, timestamp, and window-scale options; `minimal` sends
+a bare SYN. StrataTrace does not complete the connection. UDP checksums are zero to preserve the flow
+identity while changing the correlation payload; this is valid for IPv4 but one
+reason this release does not claim IPv6 support.
 
 ## Troubleshooting macOS VPN/proxy fake IPs
 
@@ -151,7 +171,8 @@ TTL 2-4  OPAQUE  10.0.1.1 => 203.0.113.9
 
 - `DIRECT`: adjacent fixed-flow TTL observations agree.
 - `MULTIPATH`: controlled flow variants produce multiple signatures while the
-  fixed-flow signature remains stable.
+  fixed-flow signature remains stable. The output lists responder counts at
+  each TTL where branches were directly observed.
 - `UNSTABLE`: the same fixed flow produces different responder addresses over
   the measurement window; timeouts alone never trigger this class.
 - `INTERMITTENT`: ICMP visibility changes, but every received response still
@@ -160,6 +181,9 @@ TTL 2-4  OPAQUE  10.0.1.1 => 203.0.113.9
 - `MUTABLE`: the ICMP quotation reveals changed address, port, or DSCP/ECN fields.
 - `OPAQUE`: sampled TTL positions remain unobservable between visible
   boundaries.
+- `SILENT_TAIL`: probes after the last visible responder through the configured
+  maximum receive no response. Because there is no visible egress, this is not
+  certified as `OPAQUE` and does not identify a tunnel or filtering mechanism.
 - `UNKNOWN`: the evidence or probe budget cannot support a stronger class.
 
 `CERTIFIED` is printed only for flow-variant CAP coverage. Mutation and
@@ -167,11 +191,12 @@ same-flow temporal observations instead report `fixed-flow evidence` and make
 no cross-flow coverage claim. Neither label is the probability that a guessed
 physical topology is true. See [docs/ALGORITHM.md](docs/ALGORITHM.md).
 
-When a UDP trace has visible hops but receives no terminal ICMP response, the
+When a trace has visible hops but receives no terminal response, the
 destination may be silently filtering that traffic class. StrataTrace reports
 this as unconfirmed rather than treating the last visible router as the target.
-Run a separate `--protocol icmp` trace for comparison; the two traffic classes
-are never spliced into one path.
+`SILENT_TAIL` records exactly how far probing continued. Run separate TCP, UDP,
+and ICMP traces for comparison; the traffic classes are never spliced into one
+path.
 
 ## Test and verify
 
@@ -196,7 +221,7 @@ gap.
 
 ## Current scope and honest limitations
 
-- IPv4 only; UDP and ICMP Echo traffic classes.
+- IPv4 only; UDP, ICMP Echo, and TCP SYN traffic classes.
 - Raw probes use the IPv4 IP-ID as the minimum-quotation correlation key and a
   session tag when the router quotes enough payload. An unusual device hashing
   on IP-ID can still create per-packet variation; StrataTrace will normally
@@ -210,6 +235,13 @@ gap.
   identical responses to every allowed probe. Lack of RFC 4950 data is never
   interpreted as lack of MPLS.
 - Responding interface IPs are not automatically alias-resolved into routers.
+- TCP sequence numbers vary to correlate minimum ICMP quotations and direct
+  acknowledgements. A device that hashes TCP sequence or IPv4 IP-ID beyond the
+  normal five-tuple can still expose per-packet behavior; StrataTrace reports
+  the resulting fixed-flow variation rather than hiding it.
+- TCP SYN options are intentionally stable within a run. The `standard` profile
+  is representative rather than an emulation of the local kernel's exact TCP
+  fingerprint; compare `minimal` when diagnosing option-sensitive policy.
 
 These are measurement-model boundaries, not hidden caveats.
 
@@ -219,6 +251,7 @@ These are measurement-model boundaries, not hidden caveats.
 - [RFC 4950 — ICMP Extensions for MPLS](https://www.rfc-editor.org/rfc/rfc4950.html)
 - [RFC 5837 — Interface and Next-Hop Identification](https://www.rfc-editor.org/rfc/rfc5837.html)
 - [RFC 1812 — Requirements for IP Version 4 Routers](https://www.rfc-editor.org/rfc/rfc1812.html)
+- [RFC 9293 — Transmission Control Protocol](https://www.rfc-editor.org/rfc/rfc9293.html)
 - [IANA IPv4 Special-Purpose Address Registry](https://www.iana.org/assignments/iana-ipv4-special-registry/iana-ipv4-special-registry.xhtml)
 - [RFC 2544 — Network Interconnect Device Benchmarking](https://www.rfc-editor.org/rfc/rfc2544.html)
 - [Paris traceroute publications](https://paris-traceroute.net/publications/)

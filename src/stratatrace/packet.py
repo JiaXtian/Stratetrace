@@ -16,6 +16,9 @@ TAG_MAGIC = b"STRT"
 TAG_FORMAT = "!4sIHBx"
 TAG_SIZE = struct.calcsize(TAG_FORMAT)
 ICMP_STABLE_CHECKSUM = 0x5A5A
+TCP_FLAG_RST = 0x04
+TCP_FLAG_SYN = 0x02
+TCP_FLAG_ACK = 0x10
 
 
 class PacketParseError(ValueError):
@@ -41,8 +44,8 @@ class ParsedResponse:
     kind: ReplyKind
     responder: str
     reply_ttl: Optional[int]
-    icmp_type: int
-    icmp_code: int
+    icmp_type: Optional[int]
+    icmp_code: Optional[int]
     terminal: bool
     quoted_ttl: Optional[int]
     quoted_source: Optional[str]
@@ -54,6 +57,11 @@ class ParsedResponse:
     quoted_dscp_ecn: Optional[int]
     session_verified: bool
     extensions: Optional[ExtensionEvidence]
+    quoted_tcp_sequence: Optional[int] = None
+    direct_protocol: Optional[int] = None
+    direct_source_port: Optional[int] = None
+    direct_destination_port: Optional[int] = None
+    tcp_flags: Optional[int] = None
 
 
 def ones_complement_sum(data: bytes) -> int:
@@ -136,6 +144,98 @@ def build_udp_probe(
         probe_id,
         len(udp),
     ) + udp
+
+
+def tcp_probe_sequence(session_id: int, probe_id: int) -> int:
+    """Encode a 16-bit session discriminator and probe id in TCP SEQ."""
+
+    return ((session_id & 0xFFFF) << 16) | (probe_id & 0xFFFF)
+
+
+def _transport_checksum(
+    source: str,
+    destination: str,
+    protocol: int,
+    segment: bytes,
+) -> int:
+    pseudo_header = struct.pack(
+        "!4s4sBBH",
+        socket.inet_aton(source),
+        socket.inet_aton(destination),
+        0,
+        protocol,
+        len(segment),
+    )
+    return internet_checksum(pseudo_header + segment)
+
+
+def build_tcp_syn_probe(
+    source: str,
+    destination: str,
+    source_port: int,
+    destination_port: int,
+    ttl: int,
+    probe_id: int,
+    session_id: int,
+    syn_profile: str = "standard",
+) -> bytes:
+    """Build a valid, payload-free TCP SYN for one fixed five-tuple.
+
+    TCP sequence numbers carry the correlation key because the minimum ICMP
+    quotation includes the first eight TCP bytes.  Ports remain fixed within a
+    FlowKey.  A SYN-ACK or RST+ACK can therefore terminate the trace without
+    completing a TCP connection.
+    """
+
+    if not 1 <= source_port <= 65535 or not 1 <= destination_port <= 65535:
+        raise ValueError("TCP ports must be between 1 and 65535")
+    if syn_profile == "standard":
+        # A common 20-byte SYN option profile.  Its values remain constant for
+        # the run so only TTL, IP ID, TCP sequence and checksums vary between
+        # fixed-flow probes.  This is more representative of an ordinary host
+        # SYN than the deliberately sparse compatibility profile below.
+        options = (
+            struct.pack("!BBH", 2, 4, 1460)  # MSS
+            + b"\x04\x02"  # SACK permitted
+            + struct.pack("!BBII", 8, 10, session_id & 0xFFFFFFFF, 0)  # timestamps
+            + b"\x01\x03\x03\x07"  # NOP, window scale 7
+        )
+        window = 64240
+    elif syn_profile == "minimal":
+        options = b""
+        window = 65535
+    else:
+        raise ValueError("syn_profile must be 'standard' or 'minimal'")
+
+    sequence = tcp_probe_sequence(session_id, probe_id)
+    data_offset = (20 + len(options)) // 4
+    offset_and_flags = (data_offset << 12) | TCP_FLAG_SYN
+    without_checksum = struct.pack(
+        "!HHIIHHHH",
+        source_port,
+        destination_port,
+        sequence,
+        0,
+        offset_and_flags,
+        window,
+        0,
+        0,
+    ) + options
+    checksum = _transport_checksum(
+        source,
+        destination,
+        socket.IPPROTO_TCP,
+        without_checksum,
+    )
+    tcp = without_checksum[:16] + struct.pack("!H", checksum) + without_checksum[18:]
+    return _ipv4_header(
+        source,
+        destination,
+        socket.IPPROTO_TCP,
+        ttl,
+        probe_id,
+        len(tcp),
+    ) + tcp
 
 
 def _checksum_compensation(data_with_zero_word: bytes, target_checksum: int) -> int:
@@ -292,7 +392,7 @@ def parse_icmp_response(
         raise PacketParseError("unrelated ICMP message type")
     inner = parse_ipv4(icmp[8:])
     probe_id = inner.identification
-    source_port = destination_port = icmp_identifier = None
+    source_port = destination_port = icmp_identifier = tcp_sequence = None
     session_verified = False
     tag_probe_id: Optional[int] = None
     if inner.protocol == socket.IPPROTO_UDP and len(inner.payload) >= 8:
@@ -303,6 +403,14 @@ def parse_icmp_response(
             "!BBHHH", inner.payload, 0
         )
         tag_probe_id, session_verified = _read_tag(inner.payload, 8, expected_session)
+    elif inner.protocol == socket.IPPROTO_TCP and len(inner.payload) >= 8:
+        source_port, destination_port, tcp_sequence = struct.unpack_from(
+            "!HHI", inner.payload, 0
+        )
+        sequence_probe_id = tcp_sequence & 0xFFFF
+        if (tcp_sequence >> 16) == (expected_session & 0xFFFF):
+            probe_id = sequence_probe_id
+            session_verified = True
     if tag_probe_id is not None:
         if not session_verified:
             raise PacketParseError("probe tag belongs to a different session")
@@ -337,6 +445,59 @@ def parse_icmp_response(
         quoted_dscp_ecn=inner.dscp_ecn,
         session_verified=session_verified,
         extensions=extensions,
+        quoted_tcp_sequence=tcp_sequence,
+    )
+
+
+def parse_tcp_response(packet: bytes, expected_session: int) -> ParsedResponse:
+    """Parse a direct TCP SYN-ACK or RST+ACK and recover its probe id."""
+
+    outer = parse_ipv4(packet)
+    if outer.protocol != socket.IPPROTO_TCP or len(outer.payload) < 20:
+        raise PacketParseError("not a complete TCP response")
+    (
+        source_port,
+        destination_port,
+        _sequence,
+        acknowledgement,
+        offset_and_flags,
+        _window,
+        _checksum,
+        _urgent,
+    ) = struct.unpack_from("!HHIIHHHH", outer.payload, 0)
+    data_offset = (offset_and_flags >> 12) & 0x0F
+    flags = offset_and_flags & 0x01FF
+    if data_offset < 5 or len(outer.payload) < data_offset * 4:
+        raise PacketParseError("invalid TCP data offset")
+    if not (flags & TCP_FLAG_ACK):
+        raise PacketParseError("TCP response does not acknowledge a probe")
+    if not (flags & (TCP_FLAG_SYN | TCP_FLAG_RST)):
+        raise PacketParseError("TCP response is neither SYN-ACK nor RST-ACK")
+    original_sequence = (acknowledgement - 1) & 0xFFFFFFFF
+    if (original_sequence >> 16) != (expected_session & 0xFFFF):
+        raise PacketParseError("TCP acknowledgement belongs to another session")
+    return ParsedResponse(
+        probe_id=original_sequence & 0xFFFF,
+        kind=ReplyKind.DESTINATION,
+        responder=outer.source,
+        reply_ttl=outer.ttl,
+        icmp_type=None,
+        icmp_code=None,
+        terminal=True,
+        quoted_ttl=None,
+        quoted_source=None,
+        quoted_destination=None,
+        quoted_protocol=None,
+        quoted_source_port=None,
+        quoted_destination_port=None,
+        quoted_icmp_identifier=None,
+        quoted_dscp_ecn=None,
+        session_verified=True,
+        extensions=None,
+        direct_protocol=socket.IPPROTO_TCP,
+        direct_source_port=source_port,
+        direct_destination_port=destination_port,
+        tcp_flags=flags,
     )
 
 
