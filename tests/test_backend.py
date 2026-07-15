@@ -1,9 +1,11 @@
 import socket
+import errno
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 from stratatrace.backend import RawIPv4Backend, benchmark_address_diagnostic
-from stratatrace.model import FlowKey, ProbeProtocol
+from stratatrace.model import FlowKey, ProbeProtocol, TcpControlStatus
 
 
 class BackendEvidenceTests(unittest.TestCase):
@@ -61,6 +63,17 @@ class BackendEvidenceTests(unittest.TestCase):
         self.assertIn("fake-IP TUN", diagnostic)
         self.assertIn("destination=198.18.6.85", diagnostic)
         self.assertIsNone(benchmark_address_diagnostic("1.1.1.1", "10.0.0.2"))
+
+    def test_kernel_tcp_refusal_is_positive_endpoint_evidence(self):
+        control_socket = mock.Mock()
+        control_socket.connect_ex.return_value = errno.ECONNREFUSED
+        control_socket.getsockname.return_value = ("192.0.2.10", 60123)
+        with mock.patch("stratatrace.backend.socket.socket", return_value=control_socket):
+            result = self.backend.run_tcp_connect_control(443, 1.0)
+        self.assertEqual(result.status, TcpControlStatus.REFUSED)
+        self.assertTrue(result.positive_transport_response)
+        control_socket.connect_ex.assert_called_once_with(("203.0.113.9", 443))
+        control_socket.close.assert_called_once()
 
 
 if __name__ == "__main__":

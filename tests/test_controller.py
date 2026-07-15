@@ -26,6 +26,33 @@ def run_scenario(name: str):
 
 
 class ControllerTests(unittest.TestCase):
+    def test_tcp_kernel_control_runs_after_all_raw_probe_batches(self):
+        class OrderingBackend(ScriptedBackend):
+            def __init__(self, fixture):
+                super().__init__(fixture)
+                self.events = []
+
+            def send_batch(self, specs):
+                self.events.append("raw")
+                return super().send_batch(specs)
+
+            def run_tcp_connect_control(self, destination_port, timeout):
+                self.events.append("control")
+                return super().run_tcp_connect_control(destination_port, timeout)
+
+        backend = OrderingBackend(FIXTURES / "silent_tail.json")
+        config = TraceConfig(
+            protocol=ProbeProtocol.TCP,
+            destination_port=443,
+            tcp_connect_control=True,
+            max_hops=8,
+            chunk_size=4,
+            seed=7,
+        )
+        result = TraceController(backend, config).run("control-order")
+        self.assertIsNotNone(result.tcp_connect_control)
+        self.assertEqual(backend.events[-1], "control")
+
     def test_interrupt_returns_an_auditable_partial_result(self):
         class InterruptingBackend(ScriptedBackend):
             def __init__(self, fixture):
@@ -74,6 +101,15 @@ class ControllerTests(unittest.TestCase):
         opaque = next(item for item in result.segments if item.type == SegmentType.OPAQUE)
         self.assertEqual(opaque.certificate.method, "flow_variant_coverage")
         self.assertTrue(opaque.certificate.certified)
+
+    def test_identical_visibility_claims_are_coalesced_with_all_reasons(self):
+        result = run_scenario("duplicate_visibility")
+        intermittent = [
+            item for item in result.segments if item.type == SegmentType.INTERMITTENT
+        ]
+        self.assertEqual(len(intermittent), 1)
+        self.assertIn("flow-sensitive visibility", intermittent[0].reasons)
+        self.assertIn("intermittent response visibility", intermittent[0].reasons)
 
     def test_zero_response_stops_after_one_sweep_without_false_direct_segment(self):
         result = run_scenario("all_timeout")

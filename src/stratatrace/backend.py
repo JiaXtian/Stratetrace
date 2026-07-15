@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import json
+import errno
 import ipaddress
+import json
 import random
 import select
 import socket
@@ -21,6 +22,8 @@ from .model import (
     ProbeProtocol,
     ProbeSpec,
     ReplyKind,
+    TcpConnectControl,
+    TcpControlStatus,
 )
 from .packet import (
     PacketParseError,
@@ -166,6 +169,65 @@ class RawIPv4Backend:
         result = self._next_probe_id
         self._next_probe_id = 1 if result == 65535 else result + 1
         return result
+
+    def run_tcp_connect_control(
+        self, destination_port: int, timeout: float
+    ) -> TcpConnectControl:
+        """Use the host TCP stack as an explicitly separate reachability control.
+
+        A successful call completes and immediately closes a no-application-data
+        TCP handshake.  It is never inserted into the raw-probe path graph.
+        """
+
+        started = time.monotonic_ns()
+        control = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        control.settimeout(timeout)
+        status = TcpControlStatus.ERROR
+        error_text: Optional[str] = None
+        local_source: Optional[str] = None
+        try:
+            code = control.connect_ex((self.destination, destination_port))
+            try:
+                local_source = str(control.getsockname()[0])
+            except OSError:
+                local_source = self.source
+            if code == 0:
+                status = TcpControlStatus.CONNECTED
+            elif code == errno.ECONNREFUSED:
+                # A TCP RST is a positive transport response even though the
+                # service is closed.  A middlebox can synthesize it, so the
+                # result is not asserted to identify the physical endpoint.
+                status = TcpControlStatus.REFUSED
+                error_text = errno.errorcode.get(code, str(code))
+            elif code in {errno.ETIMEDOUT, errno.EAGAIN}:
+                status = TcpControlStatus.TIMEOUT
+                error_text = errno.errorcode.get(code, str(code))
+            elif code in {
+                errno.ENETUNREACH,
+                errno.EHOSTUNREACH,
+                errno.EHOSTDOWN,
+            }:
+                status = TcpControlStatus.UNREACHABLE
+                error_text = errno.errorcode.get(code, str(code))
+            else:
+                status = TcpControlStatus.ERROR
+                error_text = errno.errorcode.get(code, str(code))
+        except socket.timeout as exc:
+            status = TcpControlStatus.TIMEOUT
+            error_text = str(exc) or "timeout"
+        except OSError as exc:
+            status = TcpControlStatus.ERROR
+            error_text = f"{exc.__class__.__name__}: {exc}"
+        finally:
+            control.close()
+        return TcpConnectControl(
+            status=status,
+            destination=self.destination,
+            destination_port=destination_port,
+            duration_ms=(time.monotonic_ns() - started) / 1_000_000.0,
+            source=local_source,
+            error=error_text,
+        )
 
     def _packet(self, spec: ProbeSpec) -> bytes:
         if spec.flow.protocol == ProbeProtocol.UDP:
@@ -397,6 +459,20 @@ class ScriptedBackend:
 
     def close(self) -> None:
         return None
+
+    def run_tcp_connect_control(
+        self, destination_port: int, timeout: float
+    ) -> TcpConnectControl:
+        rule = self.scenario.get("tcp_connect_control", {})
+        status = TcpControlStatus(str(rule.get("status", "timeout")))
+        return TcpConnectControl(
+            status=status,
+            destination=self.destination,
+            destination_port=destination_port,
+            duration_ms=float(rule.get("duration_ms", timeout * 1000.0)),
+            source=str(rule.get("source", self.source)),
+            error=(str(rule["error"]) if "error" in rule else None),
+        )
 
     def send_batch(self, specs: Sequence[ProbeSpec]) -> List[ProbeObservation]:
         result = []

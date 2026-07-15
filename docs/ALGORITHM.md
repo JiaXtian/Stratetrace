@@ -43,6 +43,11 @@ large region whose highest-priority label hides the others. Overlapping
 cross-flow regions share complete aggregate probe bundles, so this richer result
 does not duplicate the CAP sample budget.
 
+After classification, byte-for-byte equivalent evidence summaries for the same
+TTL interval and behavior class are coalesced. Their reason sets are unioned.
+This preserves independent triggers internally without presenting two identical
+`INTERMITTENT` regions as if they were two forwarding events.
+
 For a short gap, every TTL in the boundary window is repeated. For a long gap,
 the baseline covers every TTL once while DBP repeats its two adjacent boundary
 pairs and a midpoint sentinel. This bounds cost while retaining explicit
@@ -102,6 +107,26 @@ An unanswered suffix after the last visible responder is modeled separately as
 probed, but has no egress and is never CAP-certified as an opaque segment. This
 avoids an invalid inference shared by many path tools: `no ICMP response` does
 not imply either `no forwarding` or `one hidden hop per TTL`.
+
+## TCP kernel control
+
+Raw SYN probes and ordinary host TCP connections are not guaranteed to belong
+to the same forwarding or policy equivalence class. When explicitly requested,
+StrataTrace performs one host-kernel `connect` to the already selected IPv4
+address and port, then immediately closes it without application data. The
+control runs only after all raw path probes so that newly created NAT,
+firewall, proxy, or server state cannot prime the measured trace.
+
+`CONNECTED` and `REFUSED` are positive transport outcomes: either a handshake
+completed or an RST was observed by the kernel. Neither proves that the
+physical destination, rather than a proxy or middlebox, generated the outcome.
+`TIMEOUT` and `UNREACHABLE` remain ambiguous. The source address is recorded and
+compared with the raw-probe source.
+
+This control is never a hop observation, never closes an opaque gap, and never
+changes the raw trace's `reached` value. Its purpose is narrower: distinguishing
+“no raw terminal response” from “the host TCP stack also has no positive
+transport outcome.”
 
 ## Identifiability limit
 

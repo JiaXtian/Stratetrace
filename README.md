@@ -44,6 +44,11 @@ flows when identifying probes. StrataTrace instead:
   compatibility profile for controlled A/B diagnosis;
 - separates overlapping visibility, mutation, temporal, and multipath evidence
   into independent boundaries while sharing their adaptive probe bundles;
+- coalesces independently triggered evidence families when they certify the
+  exact same behavior window, retaining every reason without printing a false
+  duplicate path event;
+- optionally compares raw TCP SYN visibility with a host-kernel TCP connection
+  control, kept explicitly outside the measured path graph;
 - emits structured JSON for measurement pipelines.
 
 The behavior model is not tied to satellite networks or to MPLS. It applies to
@@ -91,6 +96,10 @@ sudo stratatrace --protocol tcp --dport 80 example.com
 # A/B test a bare TCP SYN if a middlebox treats the default host-like SYN differently
 sudo stratatrace --protocol tcp --tcp-syn-profile minimal example.com
 
+# Diagnose raw-SYN silence against the host TCP stack. This completes and
+# immediately closes one no-application-data TCP handshake.
+sudo stratatrace --protocol tcp --tcp-connect-control example.com
+
 # Lower-cost diagnosis
 sudo stratatrace --profile fast example.com
 
@@ -105,9 +114,17 @@ sudo stratatrace --json --include-observations example.com
 The fixed UDP destination port defaults to 33434. TCP defaults to port 443 and
 can target any explicit `--dport`. The default `standard` TCP SYN profile carries
 stable MSS, SACK-permitted, timestamp, and window-scale options; `minimal` sends
-a bare SYN. StrataTrace does not complete the connection. UDP checksums are zero to preserve the flow
+a bare SYN. Raw TCP path probes do not complete the connection. UDP checksums are zero to preserve the flow
 identity while changing the correlation payload; this is valid for IPv4 but one
 reason this release does not claim IPv6 support.
+
+The optional `--tcp-connect-control` is deliberately different: it asks the
+host kernel to complete and immediately close one TCP connection without
+sending application data. A successful connection or refusal is positive
+transport evidence, but can still be produced or redirected by a local proxy or
+middlebox. The result is reported separately and is never inserted into the raw
+traceroute path. The source address used by both modes is compared and a warning
+is emitted if they differ.
 
 ## Troubleshooting macOS VPN/proxy fake IPs
 
@@ -198,6 +215,12 @@ this as unconfirmed rather than treating the last visible router as the target.
 and ICMP traces for comparison; the traffic classes are never spliced into one
 path.
 
+For TCP, a `SILENT_TAIL` can be further diagnosed with
+`--tcp-connect-control`. If the kernel control succeeds while the raw trace
+remains silent, the defensible conclusion is protocol/probe-shape or
+local-stack/proxy-dependent visibility—not destination unreachability and not a
+recoverable sequence of hidden routers.
+
 ## Test and verify
 
 ```bash
@@ -242,6 +265,9 @@ gap.
 - TCP SYN options are intentionally stable within a run. The `standard` profile
   is representative rather than an emulation of the local kernel's exact TCP
   fingerprint; compare `minimal` when diagnosing option-sensitive policy.
+- The optional kernel TCP control changes external state by completing a TCP
+  handshake. It sends no application data and closes immediately, but should
+  only be used against targets you are authorized to contact.
 
 These are measurement-model boundaries, not hidden caveats.
 

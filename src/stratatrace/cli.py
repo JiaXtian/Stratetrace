@@ -55,6 +55,14 @@ def build_parser() -> argparse.ArgumentParser:
             "options; minimal sends a bare SYN (default: standard)"
         ),
     )
+    parser.add_argument(
+        "--tcp-connect-control",
+        action="store_true",
+        help=(
+            "separately test TCP reachability with the host kernel; completes and "
+            "immediately closes a no-data handshake, never joins it to the raw path"
+        ),
+    )
     parser.add_argument("--source", help="explicit IPv4 source address")
     parser.add_argument(
         "--allow-benchmark-address",
@@ -153,6 +161,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         destination_port=destination_port,
         source_port=args.sport,
         tcp_syn_profile=args.tcp_syn_profile,
+        tcp_connect_control=args.tcp_connect_control,
         seed=args.seed,
         payload_size=args.payload_size,
     )

@@ -32,6 +32,14 @@ class SegmentType(str, Enum):
     UNKNOWN = "unknown"
 
 
+class TcpControlStatus(str, Enum):
+    CONNECTED = "connected"
+    REFUSED = "refused"
+    TIMEOUT = "timeout"
+    UNREACHABLE = "unreachable"
+    ERROR = "error"
+
+
 @dataclass(frozen=True)
 class FlowKey:
     """Fields intentionally kept equal for one forwarding-equivalence sample."""
@@ -191,6 +199,7 @@ class TraceResult:
     termination: Optional["TerminationSummary"] = None
     probed_max_ttl: int = 0
     interrupted: bool = False
+    tcp_connect_control: Optional["TcpConnectControl"] = None
 
     def to_dict(self, include_observations: bool = True) -> Dict[str, Any]:
         raw = asdict(self)
@@ -208,6 +217,22 @@ class TerminationSummary:
     icmp_type: Optional[int]
     icmp_code: Optional[int]
     tcp_flags: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class TcpConnectControl:
+    """Kernel TCP reachability control, kept separate from path evidence."""
+
+    status: TcpControlStatus
+    destination: str
+    destination_port: int
+    duration_ms: float
+    source: Optional[str] = None
+    error: Optional[str] = None
+
+    @property
+    def positive_transport_response(self) -> bool:
+        return self.status in {TcpControlStatus.CONNECTED, TcpControlStatus.REFUSED}
 
 
 def _enum_values(value: Any) -> Any:

@@ -7,7 +7,7 @@ import socket
 import statistics
 import time
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import DefaultDict, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -23,6 +23,7 @@ from .model import (
     SegmentCertificate,
     SegmentSummary,
     SegmentType,
+    TcpConnectControl,
     TerminationSummary,
     TraceResult,
 )
@@ -48,6 +49,7 @@ class TraceConfig:
     destination_port: int = 33434
     source_port: Optional[int] = None
     tcp_syn_profile: str = "standard"
+    tcp_connect_control: bool = False
     seed: Optional[int] = None
     payload_size: int = 32
 
@@ -78,6 +80,8 @@ class TraceConfig:
             raise ValueError("source_port must be between 1 and 65535")
         if self.tcp_syn_profile not in {"standard", "minimal"}:
             raise ValueError("tcp_syn_profile must be 'standard' or 'minimal'")
+        if self.tcp_connect_control and self.protocol != ProbeProtocol.TCP:
+            raise ValueError("tcp_connect_control is available only with --protocol tcp")
         if self.payload_size < 16 or self.payload_size > 1400:
             raise ValueError("payload_size must be between 16 and 1400")
         validate_probability(self.min_detectable_probability, "min_detectable_probability")
@@ -114,6 +118,7 @@ class TraceController:
             self.config.min_detectable_probability, self.config.miss_probability
         )
         regions: List[BoundaryRegion] = []
+        tcp_control: Optional[TcpConnectControl] = None
         interrupted = False
         try:
             self._baseline(main_flow)
@@ -134,6 +139,22 @@ class TraceController:
                     )
                 ]
             self._probe_regions(regions, main_flow, required)
+            # Run the optional kernel control only after raw measurement.  A
+            # completed connection can create NAT, firewall, proxy, or server
+            # state and must not prime the path being diagnosed.
+            if (
+                self.config.protocol == ProbeProtocol.TCP
+                and self.config.tcp_connect_control
+            ):
+                control_runner = getattr(self.backend, "run_tcp_connect_control", None)
+                if control_runner is None:
+                    self.warnings.append(
+                        "The selected backend does not implement the requested kernel TCP control."
+                    )
+                else:
+                    tcp_control = control_runner(
+                        self.config.destination_port, self.config.timeout
+                    )
         except KeyboardInterrupt:
             interrupted = True
             self.warnings.append(
@@ -190,6 +211,33 @@ class TraceController:
                 "selected traffic class; the last visible responder is not proof that the "
                 f"destination was reached. {comparison} as separate diagnostic traces."
             )
+            if (
+                self.config.protocol == ProbeProtocol.TCP
+                and not self.config.tcp_connect_control
+            ):
+                self.warnings.append(
+                    "Use --tcp-connect-control to compare this raw-SYN result with the "
+                    "host kernel's TCP stack. The control completes and immediately "
+                    "closes a no-application-data handshake; it is never joined to the path."
+                )
+        if tcp_control is not None:
+            if tcp_control.source and tcp_control.source != self.backend.source:
+                self.warnings.append(
+                    f"Kernel TCP control used source {tcp_control.source}, while raw probes "
+                    f"used {self.backend.source}; the control may have followed a different route."
+                )
+            if tcp_control.positive_transport_response and not reached:
+                self.warnings.append(
+                    "The kernel TCP control received a positive transport response, but the raw SYN "
+                    "trace received no terminal response. This is evidence of probe-shape, "
+                    "local-stack/proxy, or policy-dependent visibility—not proof of endpoint unreachability "
+                    "and not a recoverable hidden-hop sequence."
+                )
+            elif not tcp_control.positive_transport_response:
+                self.warnings.append(
+                    "The kernel TCP control also received no positive transport response; this remains "
+                    "compatible with filtering, routing failure, or a nonresponsive service."
+                )
         hops = self._summarize_hops(stop_ttl or analysis_limit, main_flow)
         segments = self._summarize_segments(regions, hops, required)
         if has_silent_tail:
@@ -236,6 +284,7 @@ class TraceController:
                     if self.config.protocol == ProbeProtocol.TCP
                     else None
                 ),
+                "tcp_connect_control": self.config.tcp_connect_control,
             },
             termination=(
                 TerminationSummary(
@@ -251,6 +300,7 @@ class TraceController:
             ),
             probed_max_ttl=probed_max_ttl,
             interrupted=interrupted,
+            tcp_connect_control=tcp_control,
         )
         self.backend.close()
         return result
@@ -690,7 +740,9 @@ class TraceController:
     def _summarize_segments(
         self, regions: Sequence[BoundaryRegion], hops: Sequence[HopSummary], required: int
     ) -> List[SegmentSummary]:
-        special = [self._classify_region(region, hops, required) for region in regions]
+        special = self._coalesce_segments(
+            [self._classify_region(region, hops, required) for region in regions]
+        )
         covered_edges = set()
         for region in regions:
             covered_edges.update(range(region.first_ttl, region.last_ttl))
@@ -732,6 +784,50 @@ class TraceController:
                 )
             )
         return sorted(direct + special, key=lambda item: (item.first_ttl, item.last_ttl))
+
+    @staticmethod
+    def _coalesce_segments(segments: Sequence[SegmentSummary]) -> List[SegmentSummary]:
+        """Merge duplicate claims while retaining every independent reason.
+
+        Evidence families stay separate during detection and adaptive sampling,
+        but two families can converge on the exact same classified behavior.
+        Presenting those as duplicate boundaries falsely suggests two path
+        events, so they are coalesced only when their evidence summaries and
+        certificates are otherwise identical.
+        """
+
+        merged: List[SegmentSummary] = []
+        for segment in segments:
+            duplicate_index = next(
+                (
+                    index
+                    for index, existing in enumerate(merged)
+                    if (
+                        existing.type == segment.type
+                        and existing.first_ttl == segment.first_ttl
+                        and existing.last_ttl == segment.last_ttl
+                        and existing.ingress == segment.ingress
+                        and existing.egress == segment.egress
+                        and existing.fixed_outcomes == segment.fixed_outcomes
+                        and existing.varied_outcomes == segment.varied_outcomes
+                        and existing.certificate == segment.certificate
+                        and existing.branches == segment.branches
+                    )
+                ),
+                None,
+            )
+            if duplicate_index is None:
+                merged.append(segment)
+                continue
+            existing = merged[duplicate_index]
+            merged[duplicate_index] = replace(
+                existing,
+                reasons=tuple(dict.fromkeys(existing.reasons + segment.reasons)),
+                explicit_mechanism=(
+                    existing.explicit_mechanism or segment.explicit_mechanism
+                ),
+            )
+        return merged
 
     def _summarize_silent_tail(
         self,

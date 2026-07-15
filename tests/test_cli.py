@@ -102,6 +102,44 @@ class CliTests(unittest.TestCase):
             json.loads(stdout.getvalue())["policy"]["tcp_syn_profile"], "minimal"
         )
 
+    def test_tcp_kernel_control_is_separate_machine_readable_evidence(self):
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            status = main(
+                [
+                    "--simulate",
+                    str(FIXTURES / "silent_tail.json"),
+                    "--protocol",
+                    "tcp",
+                    "--tcp-connect-control",
+                    "--max-hops",
+                    "8",
+                    "--json",
+                    "example.invalid",
+                ]
+            )
+        self.assertEqual(status, 1)
+        document = json.loads(stdout.getvalue())
+        self.assertEqual(document["tcp_connect_control"]["status"], "connected")
+        self.assertFalse(document["reached"])
+        self.assertTrue(
+            any("kernel TCP control" in item for item in document["warnings"])
+        )
+
+    def test_tcp_kernel_control_is_rejected_for_udp(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            status = main(
+                [
+                    "--simulate",
+                    str(FIXTURES / "transparent.json"),
+                    "--tcp-connect-control",
+                    "example.invalid",
+                ]
+            )
+        self.assertEqual(status, 2)
+        self.assertIn("only with --protocol tcp", stderr.getvalue())
+
     def test_invalid_probability_is_rejected(self):
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):

@@ -1,6 +1,11 @@
 {
   "source": "192.0.2.10",
   "destination": "203.0.113.9",
+  "tcp_connect_control": {
+    "status": "connected",
+    "duration_ms": 12.5,
+    "source": "192.0.2.10"
+  },
   "hops": {
     "1": {"fixed": ["10.0.0.1"], "varied": ["10.0.0.1"], "rtt_ms": 1.0},
     "2": {"fixed": ["10.0.1.1"], "varied": ["10.0.1.1"], "rtt_ms": 2.0},

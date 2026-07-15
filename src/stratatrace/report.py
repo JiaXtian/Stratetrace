@@ -37,6 +37,18 @@ def render_text(result: TraceResult, verbose: bool = False) -> str:
     )
     if result.protocol.value == "tcp":
         lines[-1] += f"; TCP SYN profile={result.policy.get('tcp_syn_profile', 'standard')}"
+    if result.tcp_connect_control is not None:
+        control = result.tcp_connect_control
+        transport_evidence = (
+            "; positive transport response"
+            if control.positive_transport_response
+            else "; no positive transport response"
+        )
+        lines.append(
+            f"TCP kernel control: {control.status.value.upper()}{transport_evidence}; "
+            f"{control.duration_ms:.1f} ms; source={control.source or '?'} "
+            "(separate reachability evidence, not a path hop)"
+        )
     lines.append("")
     for hop in result.hops:
         if hop.primary is None:
